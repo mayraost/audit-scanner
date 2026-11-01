@@ -1,0 +1,24 @@
+{
+  "name": "audit-scanner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Nightly CVE-Audit-Scanner: GitHub-Repos scannen (trivy), Advisories matchen, Telegram-Report, optionale Auto-Fix-PRs.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc",
+    "scan": "npm run build && node dist/index.js scan",
+    "inventory": "node dist/index.js inventory",
+    "test-telegram": "node dist/index.js test-telegram"
+  },
+  "dependencies": {
+    "semver": "^7.7.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/semver": "^7.7.1",
+    "typescript": "^5.9.3"
+  }
+}

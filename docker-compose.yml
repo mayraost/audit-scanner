@@ -1,0 +1,27 @@
+# Coolify: docker-compose-App. KEINE Ports, KEINE Domain, KEIN networks-Block
+# (implizites Projekt-Default-Netz — Coolify-Regel gegen DNS-Alias-Kollisionen).
+# App-Environment injiziert (nicht im Repo).
+services:
+  audit-scanner:
+    build:
+      context: .
+    image: audit-scanner:latest
+    container_name: audit-scanner
+    restart: unless-stopped
+    environment:
+      GH_TOKEN: ${GH_TOKEN}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      ENABLE_FIX_PRS: ${ENABLE_FIX_PRS:-0}
+      SKIP_REPOS: ${SKIP_REPOS:-}
+      Cron in Container-Zeit (TZ=Europe/Berlin im Image): 16:00 Ortszeit.
+      CRON_SCHEDULE: ${CRON_SCHEDULE:-0 16 * * *}
+    volumes:
+      - audit-reports:/app/reports   # Report-JSON/MD + .heartbeat
+      - audit-cache:/app/.cache      # Trivy-DB (nur 1× laden statt jede Nacht)
+      - audit-logs:/app/logs
+
+volumes:
+  audit-reports:
+  audit-cache:
+  audit-logs:
