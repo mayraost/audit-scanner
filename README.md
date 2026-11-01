@@ -22,9 +22,16 @@ keine Ports, keine Domain, reiner Batch-Job.
    Zusammenfassung + Image-/Cache-Status. Ohne Telegram-Config wird der Versand
    still übersprungen (Scan läuft trotzdem).
 5. **Fix-PRs** (opt-in, `ENABLE_FIX_PRS=1`): pro Repo ein Branch
-   `cve-audit/fixes-<YYYY-MM-DD>`, Version-Bump betroffener Deps in
-   `package.json` (PUT `/contents` mit korrektem Blob-SHA), PR gegen den
-   Default-Branch. Bereits offene PRs desselben Branches werden erkannt statt
+   `cve-audit/fixes-<YYYY-MM-DD>`. **PR-Policy: IMMER ein PR, sobald ein
+   fixbares Finding vorliegt** — unabhängig vom Repo-Ökosystem. Ökosystem/Manifest
+   stammt aus dem Trivy-Evidenzpfad je Finding (auch mehrere Manifests pro Repo):
+   npm-Familie bump in `package.json` im jew. Manifestverzeichnis (direkte Deps),
+   transitive via `overrides` bzw. pnpm `overrides` in `pnpm-workspace.yaml`
+   inkl. Lockfile-Regen im selben Verzeichnis; pip bump requirements.txt-Zeile
+   `pkg==X` / `pkg>=X` auf die gepatchte Version (Kommentar
+   `# cve-audit GHSA-…: old → new`). Findings ohne verwertbare first_patched-Version
+   (Anzeige „—“) erhalten keinen PR-Anteil, erscheinen im Telegram-Report mit
+   `⚠️ keine gepatchte Version`. Bereits offene PRs desselben Branches werden erkannt statt
    dupliziert — und via `reports/state.json` tagesübergreifend dedupliziert
    (siehe „Reminder & PR dedupe“).
 6. **Heartbeat**: Nach jedem Scan-Lauf wird `/app/reports/.heartbeat`
@@ -206,6 +213,7 @@ npm ci
 npm run build          # tsc → dist/
 node dist/index.js inventory      # Inventarlisting (Repos + Ökosysteme)
 node dist/index.js scan           # voller Durchlauf (Scan + Telegram + Fix-PRs)
+node dist/index.js scan --only=private-ai-interface   # Probe-Lauf: nur dieses Repo
 node dist/index.js test-telegram  # 1 Config-Testnachricht an Telegram
 ```
 

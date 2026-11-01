@@ -24,6 +24,8 @@ COMMANDS
   scan          Inventar + tarball + trivy fs + Advisories + (opt) Fix-PRs + Telegram
                 Fix-PRs nur mit ENABLE_FIX_PRS=1; Repos via SKIP_REPOS oder
                 repo-lokaler Datei .cve-audit-skip ausklammerbar.
+                scan --only=repo1,repo2: nur diese Repos scannen (Probe-Lauf,
+                Full-Scan-Zeit sparen; state/Telegram-Flow unverändert).
   inventory     Nur Inventarlisting (Repos + erkannte Manifests/Ökosysteme).
   test-telegram 1 Test-Nachricht via TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID senden.
   triage-test   LLM-Triage mit 2 Fake-Findings prüfen (kein Scan, kein Telegram).
@@ -50,9 +52,19 @@ ENV
 
 async function main(): Promise<void> {
   const cmd = process.argv[2];
+  // --only=repo1,repo2 → Inventarfilter (Probe-Lauf einzelner Repos ohne Full-Scan)
+  const onlyArg = process.argv.slice(3).find((a) => a.startsWith('--only='));
+  const onlyRepos = onlyArg
+    ? onlyArg.slice('--only='.length).split(',').map((s) => s.trim()).filter(Boolean)
+    : undefined;
   switch (cmd) {
     case 'scan': {
-      const report = await runScan({ sendTelegram: true, fixPrs: fixPrsEnabled() });
+      if (onlyRepos) log(`scan --only=${onlyRepos.join(',')}`);
+      const report = await runScan({
+        sendTelegram: true,
+        fixPrs: fixPrsEnabled(),
+        onlyRepos,
+      });
       log(
         `scan fertig: ${report.summary.scanned}/${report.summary.reposTotal} Repos gescannt, ` +
           `${report.summary.findings} high/critical, ${report.summary.fixPrs} Fix-PRs, ` +

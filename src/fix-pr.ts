@@ -583,7 +583,7 @@ export function bumpRequirementsTxt(
       continue;
     }
     // Rest der Zeile (bestehender Inline-Kommentar) → durch Audit-Kommentar ersetzen
-    const target = op === '==' ? patched : `>=${patched}`;
+    const target = op === '==' ? `==${patched}` : `>=${patched}`;
     const comment = `# cve-audit ${f.ghsas.join(',') || 'no GHSA'}: ${oldVer ?? '?'} → ${patched}`;
     lines[idx] = `${indent ?? ''}${name}${extras ?? ''}${target}  ${comment}`;
     bumped.push(`requirements.txt: ${name} ${oldVer ?? '?'} → ${patched} (${f.ghsas.join(', ')})`);
