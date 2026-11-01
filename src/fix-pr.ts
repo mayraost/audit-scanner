@@ -229,7 +229,7 @@ function applyBumps(
     // Transitive: overrides statt fake Bump in dependencies
     if (eco === 'npm' || eco === 'yarn') {
       const ov = (json.overrides ??= {}) as Record<string, string>;
-      const target = `${f.pkg}@${patched}`;
+      const target = patched;
       if (ov[f.pkg] !== target) {
         ov[f.pkg] = target;
         overridesAdded.push(`${f.pkg} → ${target}`);
@@ -237,7 +237,7 @@ function applyBumps(
     } else if (eco === 'pnpm') {
       const pnpmObj = (json.pnpm ??= {}) as Record<string, unknown>;
       const ov = (pnpmObj.overrides ??= {}) as Record<string, string>;
-      const target = `${f.pkg}@${patched}`;
+      const target = patched;
       if (ov[f.pkg] !== target) {
         ov[f.pkg] = target;
         overridesAdded.push(`${f.pkg} → ${target}`);
