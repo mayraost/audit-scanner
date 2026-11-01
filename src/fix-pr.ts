@@ -416,13 +416,10 @@ function applyBumps(
         log(`Fix-PR: ${f.pkg} ${patched} < ${old} (Major-Downgrade) — übersprungen.`);
         continue;
       }
-      // Versionsstil des Repos erhalten (^ / ~), sonst exakte gepatchte Version
-      const target =
-        old?.startsWith('^') === true
-          ? `^${patched}`
-          : old?.startsWith('~') === true
-            ? `~${patched}`
-            : patched;
+      // v1.5.0 Pinning-Regel (AGENTS.md "Keine floating versions"): exakte
+      // gepatchte Version statt Repos-Stil (^/~) — keine Range-Notation in
+      // package.json, Fix-Deps werden wie pins-PRs exakt geschrieben.
+      const target = patched;
       if (old !== target) {
         dep[f.pkg] = target;
         bumped.push(`${f.pkg}: ${old ?? '?'} → ${target}`);
@@ -451,7 +448,7 @@ function applyBumps(
   return { updatedPkg: `${JSON.stringify(json, null, 2)}\n`, bumped, overridesAdded };
 }
 
-async function putContent(
+export async function putContent(
   repo: string,
   filePath: string,
   branch: string,
@@ -481,7 +478,7 @@ interface RegenResult {
 }
 
 /** Lockfile im tmp-Checkout regenerieren (Spec: npm/pnpm, keine Scripts, kein node_modules). */
-async function regenerateLockfile(
+export async function regenerateLockfile(
   eco: string,
   pkgJson: string,
   lockContent: string,

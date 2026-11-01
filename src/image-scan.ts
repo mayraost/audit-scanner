@@ -7,9 +7,14 @@
 //   private/404-Images graceful skip mit Note.
 // - Freshness-Check via Registry-Tag-Liste (Docker Hub / GHCR, anonymous token
 //   flow); digest-pinned / latest / invalid Tags → Skip mit Note.
-// - Fix-PR-Policy: PR nur für EXAKT gepinnte Tags (x.y.z) mit neuerer Version
-//   im selben Major. Floating-Tags (z. B. node:24-alpine) aktualisieren sich
-//   implizit beim Rebuild → nur Report, kein PR.
+// - Fix-PR-Policy (v1.5.0, AGENTS.md "Keine floating versions"):
+//   a) EXAKT gepinnte Tags (x.y.z) mit neuerer Version im selben Major → PR-Bump
+//      auf den neueren exakten Tag.
+//   b) FLOATING Major-Tags (z. B. node:24-alpine, 24, 17.5) → NOCH ein PR:
+//      floating → neuester EXAKTER Tag im selben Major (+ Variant-Fallback:
+//      alpine → alpine3.24). Floating aktualisiert sich zwar beim Rebuild, aber
+//      exakte Pins sind Pflicht (Volo Reproducibility + Digest-Audit-Sicherheit).
+//   c) `latest` / tagless → report-only Note (kein PR — Major-Sprung-Risiko).
 
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
@@ -46,6 +51,8 @@ export interface ImageFinding {
   vulns: { high: number; critical: number };
   /** Neuester gepinnter Tag im selben Major (incl. Variant-Fallback), sonst null. */
   newestSameMajor: string | null;
+  /** Neuester EXAKTER (3-Komp) Tag im selben Major — floating→pin-Bump-Ziel. */
+  exactPin: string | null;
   /** pinned && strictly-newer same-major bei der Registry verfügbar. */
   updateAvailable: boolean;
   /** Skip-/Hinweis-Grund (private, latest, Variable, 404 …). */
@@ -60,7 +67,7 @@ export interface ImageBumpPlan {
 
 export interface ImageScanResult {
   findings: ImageFinding[];
-  bumpPlan: ImageBumpPlan[]; // nur pinned + updateAvailable
+  bumpPlan: ImageBumpPlan[]; // pinned+newer AND floating (→ exact pin)
 }
 
 const DOCKERFILE_RE = /^dockerfile(\.[^.]+)?$/i;
@@ -348,6 +355,35 @@ function strictlyNewer(currentTag: string, candidateTag: string): boolean {
   return semver.gt(b, a);
 }
 
+/**
+ * Floating→Pin-Bump-Ziel: neuester EXAKTER (3-Komp, non-prerelease) Tag im
+ * selben Major. Variant des current-Tags wird bevorzugt exakt/gematched
+ * (`alpine` → alpine3.x), sonst Prefix-Fallback auf alle 3-Komp-Tags — oder
+ * variant-frei, wenn current variant-los war. null, wenn kein Pinned-Kandidat.
+ */
+function newestExactTag(currentTag: string, tags: string[]): string | null {
+  const cur = tagSemantics(currentTag);
+  if (!cur.valid || cur.major === null || cur.prerelease) return null;
+  const cand = tags
+    .map((t) => ({ tag: t, sem: tagSemantics(t) }))
+    .filter((c) => c.sem.valid && c.sem.pinned && c.sem.major === cur.major);
+  if (cand.length === 0) return null;
+  const sameVariant = cur.variant
+    ? cand.filter(
+        (c) =>
+          c.sem.variant === cur.variant ||
+          c.sem.variant.startsWith(`${cur.variant}`) // alpine + alpine3.22
+      )
+    : cand.filter((c) => c.sem.variant === '');
+  const pool = sameVariant.length > 0 ? sameVariant : cand;
+  const scored = pool.sort((a, b) => {
+    const va = semver.coerce(stripVariant(a.tag)) ?? '0.0.0';
+    const vb = semver.coerce(stripVariant(b.tag)) ?? '0.0.0';
+    return semver.compare(va, vb);
+  });
+  return scored.at(-1)?.tag ?? null;
+}
+
 interface ImgTrivyResult {
   Results?: Array<{
     Vulnerabilities?: Array<{ VulnerabilityID: string; PkgName?: string; Severity?: string } | null> | null;
@@ -453,12 +489,27 @@ export async function scanRepoImages(
       continue;
     }
     const newest = newestSameMajorTag(f.current, tags);
-    f.newestSameMajor = newest;
+    const exact = newestExactTag(f.current, tags);
+    f.newestSameMajor = newest ?? exact;
+    f.exactPin = exact;
     if (f.pinned && newest && strictlyNewer(f.current, newest)) {
       f.updateAvailable = true;
       for (const file of f.sourceFiles) {
         const existing = bumpPlan.find((p) => p.file === file);
         const bump = { from: f.image, to: `${f.base}:${newest}` };
+        if (existing) existing.bumps.push(bump);
+        else bumpPlan.push({ file, bumps: [bump] });
+      }
+      continue;
+    }
+    if (f.floating && exact) {
+      // v1.5.0 Enforcement: floating Major-Tag → exakten Tag pinnen (PR), auch
+      // wennś frisch ist (exact-Pin-Pflicht). updateAvailable = zusätzlich
+      // neuer als die Auflösung hinter dem floating Tag.
+      if (strictlyNewer(f.current, exact)) f.updateAvailable = true;
+      for (const file of f.sourceFiles) {
+        const existing = bumpPlan.find((p) => p.file === file);
+        const bump = { from: f.image, to: `${f.base}:${exact}` };
         if (existing) existing.bumps.push(bump);
         else bumpPlan.push({ file, bumps: [bump] });
       }
@@ -477,11 +528,11 @@ function addRef(byKey: Map<string, ImageFinding>, ref: string, rel: string): voi
   const { base, tag, digest, registry } = splitRef(ref);
   const sem = tagSemantics(tag ?? 'latest');
   if (!tag) {
-    byKey.set(ref, mkFinding(ref, base, 'latest', sem, rel, false, 'kein Tag (latest implizit) — übersprungen'));
+    byKey.set(ref, mkFinding(ref, base, 'latest', sem, rel, false, 'kein Tag (latest implizit) — report-only: kein Pin'));
     return;
   }
   if (tag === 'latest') {
-    byKey.set(ref, mkFinding(ref, base, tag, sem, rel, false, 'latest — kein Pin, kein Freshness-Check'));
+    byKey.set(ref, mkFinding(ref, base, tag, sem, rel, false, 'latest — report-only (Major-Sprung-Risiko), kein Pin-PR'));
     return;
   }
   if (digest) {
@@ -520,6 +571,7 @@ function mkFinding(
     sourceFiles: [rel],
     vulns: { high: 0, critical: 0 },
     newestSameMajor: null,
+    exactPin: null,
     updateAvailable: false,
     note,
   };
@@ -578,7 +630,7 @@ export async function createImagePr(repo: RepoInfo, bumpPlan: ImageBumpPlan[], s
         {
           method: 'PUT',
           body: JSON.stringify({
-            message: `chore(cve-audit): bump docker image tags in ${planFile.file} [skip ci]`,
+            message: `chore(cve-audit): pin docker image tags to exact versions [skip ci]`,
             content: b64(updated),
             sha: file.sha,
             branch,
@@ -597,7 +649,7 @@ export async function createImagePr(repo: RepoInfo, bumpPlan: ImageBumpPlan[], s
       {
         method: 'POST',
         body: JSON.stringify({
-          title: 'chore(cve-audit): bump pinned docker image tags',
+          title: 'chore(cve-audit): pin docker image tags to exact versions',
           head: branch,
           base: repo.defaultBranch,
           body: imagePrBody(repo.name, bumps),
@@ -653,17 +705,19 @@ export function replaceTag(content: string, from: string, to: string): string {
 
 function imagePrBody(repo: string, bumps: string[]): string {
   return [
-    'Automatically generated by the `audit-scanner` (image tag bump run).',
+    'Automatically generated by the `audit-scanner` (image pin enforcement run).',
     '',
-    '### Pinned docker image tags (newer same-major version at the registry)',
+    '### Docker image tags pinned to exact versions',
     '',
     ...bumps.map((b) => `- ${b}`),
     '',
     '### Policy note',
-    'Only **exactly pinned** tags (`x.y.z`) are bumped, and only to a newer',
-    'version of the same major. Floating tags (e.g. `node:24-alpine`)',
-    'intentionally stay — they already resolve to the newest matching build',
-    'on every rebuild.',
+    'Per repo policy ("Dependency-Pinning & Update-Pflicht"): **no floating',
+    'versions**. Exactly pinned tags are bumped to the newest same-major exact',
+    'tag; floating major tags (e.g. `node:24-alpine`) are pinned to the newest',
+    'exact tag of the same major (with OS-variant fallback). `latest`/tagless',
+    'refs are report-only (`latest` can introduce a major jump) — pin those',
+    'manually first.',
     '',
     '### Checks before merge',
     'Rebuild the image after merging and verify the app starts healthy.',

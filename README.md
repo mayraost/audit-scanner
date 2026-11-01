@@ -217,14 +217,17 @@ Je Repo dedupliziert (Ref über alle Files gemerged), dann:
    `24.*-…`, Prefer gleiche `-alpine`-Varianten). Pre-Releases
    (`-alpha/-beta/-rc/-dev`) ausgeschlossen. Digest-pinned / `latest` /
    Tag-less / `$VAR`-Refs → Skip mit Note.
-3. **Fix-PR-Policy (nur exakte Pins)**: Tags mit Format `x.y.z` (z. B.
-   `aquasec/trivy:0.76.1`) und verfügbarer streng neuerer Version im selben
-   Major → Branch `cve-audit/images-<YYYY-MM-DD>`, Tag-Bump via [`contents`
-   PUT] je Quelldatei, PR mit deterministischem Body (kein LLM).
-   **Floating-Tags** (z. B. `node:24-alpine`) bekommen **keinen** PR — sie
-   zeigen bereits auf den neuesten Match des Major bei jedem Rebuild. Der
-   Report zeigt je Image `⚠️ update verfügbar` bzw. `floating
-   (aktualisiert sich beim Rebuild)`.
+3. **Fix-PR-Policy (v1.5.0: exact-pin Enforcement)**:
+   - **Exakte Tags** (`x.y.z`, z. B. `aquasec/trivy:0.76.1`) mit verfügbarer
+     streng neuerer Version im selben Major → Branch `cve-audit/images-<YYYY-MM-DD>`,
+     Tag-Bump via `contents`-PUT je Quelldatei, PR mit deterministischem Body.
+   - **Floating Major-Tags** (z. B. `node:24-alpine`) bekommen jetzt einen
+     **Pinning-PR**: floating → neuester **exakter** Tag im selben Major mit
+     Variant-Fallback (`node:24-alpine` → `node:24.22.2-alpine3.24`). Floating
+     ist laut Repo-Policy („Keine floating versions") nicht mehr ok.
+   - **`latest`/Tag-less** → nur Report-Note (report-only — `latest` kann einen
+     Major-Sprung einführen; Pins beim Menschen). Digest-pinned refs bleiben
+     skip (sind bereits reproduzierbar).
 4. **Report/Telegram**: Sektion `🐳 Images` je Repo (Image | current | newest |
    Vulns H/C | Status); Image-PRs zählen als eigene `imagePrs`-Summary
    (`Fix-PRs diesmal: … // 🐳 Image-Bump-PRs diesmal: …`).
@@ -235,6 +238,43 @@ gescannt, aber der **Freshness-Check** bleibt Docker Hub + GHCR vorbehalten
 
 `reports/state.json` kennt für Image-PRs einen Eintrag mit `kind: "image"`,
 der NICHT in der CVE-Reminder-Sektion auftaucht (kurzlebig, kein CVE-Tracking).
+
+## 📌 Pinning enforcement (seit v1.5.0)
+
+Vorgabe aus AGENTS.md („Dependency-Pinning & Update-Pflicht"): **keine
+floating versions** — alle npm-Specifier müssen exakt sein (`x.y.z`), nie
+`^`, `~`, `>=`, `*`, x/y-Ranges. Der Scanner erzwingt das je gescanntem Repo:
+
+1. **Detection**: alle `package.json` des Repos (ohne `node_modules`) werden
+   geparsed. Floating = `semver.valid(spec) === null`. Gescannt werden
+   `dependencies` + `devDependencies` (PR-Kandidaten) sowie
+   `optionalDependencies` + `peerDependencies` (observed, report-only).
+   Protocol-/Path-Specs (`workspace:*`, `file:`, `link:` …) gelten nicht als
+   Registry-Specifier → kein Finding.
+2. **severity**: `warn` für production-deps, `info` für dev/optional/peer
+   (kein CVE — Pinning ist Hygiene, kein Security-Befund). LLM-Triage und
+   -Suppress greifen NICHT für pins.
+3. **Latest-Lookup**: `registry.npmjs.org/<pkg>` → `dist-tags.latest`, Cache
+   pro Paket (wenige Lookups je Run — Rate-Limit unkritisch).
+4. **Fix-PR (immer-PR-Policy, deterministisch, kein LLM)**: ALLE floating deps
+   eines Repos in **EINEM PR** (`cve-audit/pins-<YYYY-MM-DD>`), alle
+   package.json-Manifests in derselben Branch. Bump auf exakte latest-Version,
+   Downgrade-Guard (bump nie kleiner als die floating Referenz); Major-Sprünge
+   werden im PR-Body mit `⚠️ major jump` markiert und sind bewusst vom Menschen
+   zu akzeptieren. Lockfile-Regen im selben Manifestverzeichnis
+   (`npm install --package-lock-only`-Style mit `NPM_CONFIG_ALLOW_REMOTE=all`,
+   pnpm analog via corepack `--lockfile-only`); yarn → manuelle Note.
+   Nested-Manifests (kein Lockfile im selben Verzeichnis) → manuelle Regen-Note.
+5. **CVE-Fix-PRs schneiden exakt**: Auch CVE-basierte package.json-Bumps
+   schreiben seit v1.5.0 die **exakte gepatchte Version** statt Repos-Stil
+   (`^`/`~`-Erhaltung entfernt).
+6. **Report/Telegram**: Report-Sektion `📌 Unpinned deps (package.json)` je
+   Repo (`pkg | current ^1.2.3 | latest exact X.Y.Z | scope | sev`), Summary
+   `unpinned deps: N` + `pinsPrs`-Zähler, Telegram `📌 Unpinned deps`-Block +
+   `Pins-PRs diesmal: …`. `reports/state.json` kennt `kind: "pins"`.
+7. **Dogfooding**: das Scanner-Repo selbst ist exakt gepinnt (package.json,
+   `node:24.22.2-alpine3.24` im Dockerfile, trivy `0.76.1`) — self-scan muss
+   leer durchlaufen.
 
 ## Coolify-Deployment
 

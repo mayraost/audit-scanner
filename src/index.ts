@@ -69,7 +69,8 @@ async function main(): Promise<void> {
       log(
         `scan fertig: ${report.summary.scanned}/${report.summary.reposTotal} Repos gescannt, ` +
           `${report.summary.findings} high/critical, ${report.summary.fixPrs} Fix-PRs ` +
-          `(+${report.summary.imagePrs} Image-PRs), ${report.summary.apiCalls} API-Calls.`
+          `(+${report.summary.imagePrs} Image-PRs, +${report.summary.pinsPrs} Pins-PRs, ` +
+          `${report.summary.unpinned} unpinned deps), ${report.summary.apiCalls} API-Calls.`
       );
       return;
     }

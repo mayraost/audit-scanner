@@ -3,7 +3,7 @@
 # Gotcha-Vermerk: aquasec/trivy:0.68.0 existiert auf Docker Hub MAHR (404, Tags
 # rotieren) — gepinnt ist 0.76.1 (21.10.2026), bei Upgrade unten anpassen.
 
-FROM node:24-alpine AS build
+FROM node:24.22.2-alpine3.24 AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN --mount=type=cache,id=npm,target=/root/.npm npm ci
@@ -11,12 +11,12 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN ./node_modules/.bin/tsc
 
-FROM node:24-alpine AS deps-prod
+FROM node:24.22.2-alpine3.24 AS deps-prod
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN --mount=type=cache,id=npm,target=/root/.npm npm ci --omit=dev
 
-FROM node:24-alpine AS runner
+FROM node:24.22.2-alpine3.24 AS runner
 ENV NODE_ENV=production
 ENV TZ=Europe/Berlin
 ENV TRIVY_CACHE_DIR=/app/.cache/trivy

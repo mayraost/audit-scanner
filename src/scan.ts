@@ -24,6 +24,7 @@ import { fetchAdvisories, GH_ECOSYSTEM, type AdvisoryHit } from './advisories.js
 import { loadInventory, MANIFEST_MAP, type Ecosystem, type RepoInfo } from './inventory.js';
 import { createFixPr, type FixFinding, type FixResult } from './fix-pr.js';
 import { createImagePr, scanRepoImages, type ImageFinding } from './image-scan.js';
+import { collectPinning, createPinsPr, type PinFinding } from './pinning.js';
 import {
   ageDays,
   entriesForRepo,
@@ -79,6 +80,9 @@ export interface RepoResult {
   /** Image-Scan (Dockerfile/compose): Refs, vulns, Freshness (v1.4.0). */
   images?: ImageFinding[];
   imagePr?: FixResult;
+  /** Pinning-Scan (v1.5.0): floating npm-specs je package.json (kein CVE). */
+  pins?: PinFinding[];
+  pinsPr?: FixResult;
 }
 
 export interface ReminderInfo {
@@ -99,7 +103,9 @@ export interface Report {
     findings: number;
     suppressed: number; // LLM-suppressed (decision suppress + conf >= 0.75)
     fixPrs: number;
-    imagePrs: number; // Image-Tag-Bump-PRs (separate section, fixPrs-Umgebung)
+    imagePrs: number; // Image-Tag-Pin-PRs (v1.4.0, Floating-Pin-Enforcement)
+    pinsPrs: number; // npm-Pins-PRs (v1.5.0, package.json exact-pin Enforcement)
+    unpinned: number; // alle observed floatingSpecifier (deps+dev+optional+peer)
     apiCalls: number;
     reminders: number; // offene Fix-PRs (Reminder-Sektion)
   };
@@ -227,6 +233,19 @@ export async function runScan(opts: {
           const imsg = ierr instanceof Error ? ierr.message : String(ierr);
           log(`WARN: Image-Scan für ${repo.name} fehlgeschlagen: ${imsg}`);
         }
+        // Pinning-Scan (v1.5.0): package.json-Specifier exakt? Floating-DEPS
+        // (deps/devDeps) → Pins-PR (alle Manifests, EIN PR). optional/peer nur
+        // report-only. KEIN LLM (deterministisch, keine Triage).
+        try {
+          const pin = await collectPinning(repo, repoDir);
+          res.pins = pin.findings;
+          if (opts.fixPrs && pin.fixable.length > 0) {
+            res.pinsPr = await createPinsPr(repo, pin.fixable, state);
+          }
+        } catch (perr) {
+          const pmsg = perr instanceof Error ? perr.message : String(perr);
+          log(`WARN: Pinning-Scan für ${repo.name} fehlgeschlagen: ${pmsg}`);
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log(`WARN: Scan-Fehler für ${repo.name}: ${msg}`);
@@ -248,6 +267,8 @@ export async function runScan(opts: {
       suppressed: results.reduce((n, r) => n + r.findings.filter(isSuppressed).length, 0),
       fixPrs: results.filter((r) => r.fixPr?.status === 'created').length,
       imagePrs: results.filter((r) => r.imagePr?.status === 'created').length,
+      pinsPrs: results.filter((r) => r.pinsPr?.status === 'created').length,
+      unpinned: results.reduce((n, r) => n + (r.pins?.length ?? 0), 0),
       apiCalls: ghStats.apiCalls,
       reminders: collectReminders(state).length,
     },
@@ -469,7 +490,7 @@ function collectReminders(state: State, now = new Date()): ReminderInfo[] {
   const out: ReminderInfo[] = [];
   for (const [repo, entries] of Object.entries(state.prs)) {
     for (const entry of entries) {
-      if (entry.kind === 'image') continue; // Image-PRs sind keine CVE-Reminder
+      if (entry.kind && entry.kind !== 'cve') continue; // Image/Pins-PRs sind keine CVE-Reminder
       out.push({
         repo,
         prUrl: entry.prUrl,
@@ -616,7 +637,11 @@ function renderMarkdown(report: Report): string {
   const summaryLine =
     `*Repos*: ${report.summary.reposTotal} total / ${report.summary.scanned} gescannt · ` +
     `high/critical-Advisory-Funde: ${report.summary.findings} · LLM-suppressed: ${report.summary.suppressed} · ` +
-    `Fix-PRs: ${report.summary.fixPrs}${report.summary.imagePrs ? ` (+${report.summary.imagePrs} Image)` : ''} · offene Fix-PRs (Reminder): ${report.summary.reminders} · ` +
+    `Fix-PRs: ${report.summary.fixPrs}` +
+    `${report.summary.imagePrs ? ` (+${report.summary.imagePrs} Image)` : ''}` +
+    `${report.summary.pinsPrs ? ` (+${report.summary.pinsPrs} Pins)` : ''} · ` +
+    `unpinned deps: ${report.summary.unpinned} · ` +
+    `offene Fix-PRs (Reminder): ${report.summary.reminders} · ` +
     `GitHub-API-Calls: ${report.summary.apiCalls}`;
   const lines: string[] = [
     `# CVE-Audit-Report (mayraost)`,
@@ -659,10 +684,26 @@ function renderMarkdown(report: Report): string {
     }
     if (r.fixPr?.prUrl) lines.push('', `Fix-PR: ${r.fixPr.prUrl} (${r.fixPr.status})`);
     if (r.imagePr?.prUrl) lines.push('', `Image-PR: ${r.imagePr.prUrl} (${r.imagePr.status})`);
+    if (r.pinsPr?.prUrl) lines.push('', `Pins-PR: ${r.pinsPr.prUrl} (${r.pinsPr.status})`);
     if (r.images?.length) lines.push('', imageTable(r.images));
+    if (r.pins?.length) lines.push('', pinningTable(r.pins));
     lines.push('');
   }
   return lines.join('\n');
+}
+
+/** 📌-Sektion je Repo (Report-MD): floating npm-Specifier (v1.5.0 Enforcement). */
+function pinningTable(pins: PinFinding[]): string {
+  const rows = pins.map(
+    (p) =>
+      `| ${p.pkg} | ${p.current} | ${p.latest ?? '—'} | ${p.section} | ${p.severity} |`
+  );
+  return [
+    '### 📌 Unpinned deps (package.json) — Floating-Specifier',
+    '| Package | Current | Latest exact | Scope | Sev |',
+    '|---|---|---|---|---|',
+    ...rows,
+  ].join('\n');
 }
 
 /** 🐳-Sektion je Repo (Report-MD): nur Images mit vulns/update/note. */
@@ -674,6 +715,8 @@ function imageTable(images: ImageFinding[]): string {
       rows.push(`| ${f.image} | — | — | — | ${f.note} |`);
     } else if (f.updateAvailable) {
       rows.push(`| ${f.image} | ${f.current} | ${f.newestSameMajor} | ${vc} | ⚠️ update verfügbar |`);
+    } else if (f.floating && f.exactPin) {
+      rows.push(`| ${f.image} | ${f.current} | ${f.exactPin} | ${vc} | floating → pin ${f.exactPin} |`);
     } else {
       rows.push(
         `| ${f.image} | ${f.current} | ${f.newestSameMajor ?? '—'} | ${vc} | ` +
@@ -693,7 +736,10 @@ async function sendTelegramFromReport(report: Report): Promise<void> {
   const date = parseIsoDateKey(new Date(report.generatedAt));
   const hasNew =
     report.repos.some((r) => r.findings.some((f) => !isSuppressed(f))) ||
-    report.repos.some((r) => r.images?.some((i) => i.updateAvailable) ?? false);
+    report.repos.some((r) => r.images?.some((i) => i.updateAvailable) ?? false) ||
+    // Neue Pins-PRs / neue exakte Image-Pinning-Bumps zählen als "neu" (v1.5.0)
+    report.repos.some((r) => r.pinsPr?.status === 'created') ||
+    report.repos.some((r) => r.imagePr?.status === 'created');
   const hasReminders = report.reminders.length > 0;
   if (!hasNew && !hasReminders) {
     // Keine neuen Funde UND keine offenen Fix-PRs → gar kein Versand (kein Spam).
@@ -755,19 +801,31 @@ function telegramBody(report: Report, hasNewFindings: boolean): string {
   if (suppressedCount > 0) {
     lines.push(`🔇 LLM-suppressed: ${suppressedCount}/${totalCount} Funde (Details im Report „LLM-suppressed“-Sektion).`);
   }
-  // 🐳 Image-Sektion: nur Repos mit Image-Refs und zumindest vulns>0 oder Update.
+  // 🐳 Image-Sektion: nur Repos mit Image-Refs und zumindest vulns>0, Update
+  // oder Floating→Pin-Enforcement (v1.5.0).
   const imgRepos = report.repos.filter(
-    (r) => r.images?.some((i) => !i.note && (i.updateAvailable || i.vulns.high + i.vulns.critical > 0))
+    (r) =>
+      r.images?.some(
+        (i) =>
+          !i.note &&
+          (i.updateAvailable || i.vulns.high + i.vulns.critical > 0 || (i.floating && i.exactPin))
+      )
   );
   if (imgRepos.length > 0) {
     lines.push('🐳 Image-Scan (Dockerfile/compose):');
     for (const r of imgRepos) {
       lines.push(`*${r.name}*:`);
       for (const f of r.images!) {
-        if (f.note || (!f.updateAvailable && f.vulns.high + f.vulns.critical === 0)) continue;
+        if (
+          f.note ||
+          (!f.updateAvailable && f.vulns.high + f.vulns.critical === 0 && !(f.floating && f.exactPin))
+        )
+          continue;
         const vc = `H${f.vulns.high}/C${f.vulns.critical}`;
         if (f.updateAvailable) {
           lines.push(`  • ${f.image} → ${f.newestSameMajor} ⚠️ update verfügbar [${vc}]`);
+        } else if (f.floating && f.exactPin) {
+          lines.push(`  • ${f.image} → pin ${f.exactPin} [${vc}]`);
         } else {
           lines.push(
             `  • ${f.image} [${vc}] — ${f.pinned ? 'pinned, aktuell' : 'floating (Rebuild aktualisiert)'}`
@@ -793,7 +851,11 @@ function telegramBody(report: Report, hasNewFindings: boolean): string {
   }
   const imgFixed = report.repos.filter((r) => r.imagePr?.status === 'created');
   if (imgFixed.length > 0) {
-    lines.push(`🐳 Image-Bump-PRs diesmal: ${imgFixed.map((r) => r.name).join(', ')}`);
+    lines.push(`🐳 Image-Pin-PRs diesmal: ${imgFixed.map((r) => r.name).join(', ')}`);
+  }
+  const pinsFixed = report.repos.filter((r) => r.pinsPr?.status === 'created');
+  if (pinsFixed.length > 0) {
+    lines.push(`📌 Pins-PRs diesmal: ${pinsFixed.map((r) => r.name).join(', ')}`);
   }
   return lines.join('\n\n');
 }
