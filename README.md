@@ -22,9 +22,11 @@ keine Ports, keine Domain, reiner Batch-Job.
    Zusammenfassung + Image-/Cache-Status. Ohne Telegram-Config wird der Versand
    still übersprungen (Scan läuft trotzdem).
 5. **Fix-PRs** (opt-in, `ENABLE_FIX_PRS=1`): pro Repo ein Branch
-   `cve-audit/fix-<runid>`, Version-Bump betroffener Deps in `package.json`
-   (PUT `/contents` mit korrektem Blob-SHA), PR gegen den Default-Branch.
-   Bereits offene PRs desselben Branches werden erkannt statt dupliziert.
+   `cve-audit/fixes-<YYYY-MM-DD>`, Version-Bump betroffener Deps in
+   `package.json` (PUT `/contents` mit korrektem Blob-SHA), PR gegen den
+   Default-Branch. Bereits offene PRs desselben Branches werden erkannt statt
+   dupliziert — und via `reports/state.json` tagesübergreifend dedupliziert
+   (siehe „Reminder & PR dedupe“).
 6. **Heartbeat**: Nach jedem Scan-Lauf wird `/app/reports/.heartbeat`
    getoucht — Docker-HEALTHCHECK akzeptiert Alter < 48 h (Cron-Skip-Toleranz).
 
@@ -63,12 +65,85 @@ Umgebungsvariable in Coolify (bzw. lokal in eine nicht-committete `.env`).
 | `ENABLE_FIX_PRS`     | nein    | `0`           | `1`/`true` = Auto-Fix-PRs anlegen. |
 | `SKIP_REPOS`         | nein    | —             | Kommagetrennte Repo-Namen, z. B. `archive,playground`. |
 | `CRON_SCHEDULE`      | nein    | `0 16 * * *`  | Cron in Container-Zeit (TZ=Europe/Berlin → 16:00 Ortszeit). |
+|  *(keine neuen Variablen für Reminder/Dedupe — aktiviert sich mit `ENABLE_FIX_PRS=1` automatisch)* | | | |
 | `DEEPINFRA_API_KEY`  | nein    | —             | LLM-Triage (siehe „LLM triage (optional)“). Ohne = `LLM disabled`, Scanner läuft deterministisch weiter. |
 | `LLM_MODEL`          | nein    | `zai-org/GLM-5.3-Flash` | Modell-ID am DeepInfra-Endpoint. |
 | `LLM_BASE_URL`       | nein    | `https://api.deepinfra.com/v1/openai` | OpenAI-kompatible Basis-URL. |
 
 Zusätzlich pro Repo deaktivierbar: Datei `.cve-audit-skip` im Repo-Root
 (wird im Inventar erkannt, Repo erscheint als `skip(repo-file)`).
+
+## Reminder & PR dedupe
+
+Seit v1.1.0 führt der Scanner einen persistenten PR-State
+(**`reports/state.json`**, im Docker-Volume `audit-reports` unter
+`/app/reports/state.json`), sobald Fix-PRs aktiv sind:
+
+```json
+{
+  "prs": {
+    "<repo>": [
+      {
+        "branch": "cve-audit/fixes-2026-10-31",
+        "prUrl": "https://github.com/mayraost/<repo>/pull/12",
+        "prNumber": 12,
+        "ghsaIds": ["GHSA-xxxx-yyyy"],
+        "createdAt": "2026-10-31T16:00:04.000Z",
+        "lastSeen": "2026-11-01T16:00:03.000Z",
+        "findings": [
+          { "package": "lodash", "version": "4.17.15", "severity": "critical", "ghsaId": "GHSA-xxxx-yyyy" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**PR-Dedupe vor PR-Erzeugung** (nur mit `ENABLE_FIX_PRS=1`):
+
+- Je Repo wird der Remote-Status jedes State-Eintrags geprüft
+  (`GET /repos/mayraost/{repo}/pulls?head=mayraost:{branch}&state=open`).
+- **PR noch offen** → keine erneute PR-Erstellung für dieselben Findings,
+  `lastSeen` wird aktualisiert. Diese Findings erscheinen als „neu“ **nicht
+  mehr** im Report — sie leben nur in der Reminder-Sektion.
+- **PR geschlossen/gemergt** → State-Eintrag entfällt. Findings gelten wieder
+  als neu: Ist das Package auch nach dem Merge weiterhin vulnerable (weitere
+  Advisory), wird ganz normal ein neuer PR angelegt — die CVE ist ja nicht
+  gefixt. Als „gelöst“ zählt nur, dass der vorige PR abgearbeitet ist.
+- LLM-suppressed Findings landen weiterhin **nicht** im State/Reminder
+  (sie sind bewusst verworfen) — Suppress-Verhalten unverändert.
+- JSON corrupt/fehlend (z. B. Volume-Verlust) → State startet leer und wird
+  aus GitHub rebuilt: Der nächste `exists`-Treffer bei bereits offenem
+  PR-Branch erzeugt den Eintrag erneut statt eines Duplikats.
+
+**Tägliche CVE-Erinnerung (Telegram):** Läuft der Scan also täglich, erscheint
+im Telegram-Report ganz oben in jedem Lauf mit offenen Fix-PRs:
+
+```
+⏰ Offene CVEs (Fix-PR wartet, Tag 3): <repo>
+  • GHSA-xxxx-yyyy lodash@4.17.15 [critical]
+  🛠 PR offen: https://github.com/mayraost/<repo>/pull/12
+```
+
+- Alter in Tagen = Tage seit PR-Erstellung.
+- Versand-Logik: neue Findings **oder** offene PRs existieren → Nachricht
+  (Reminder-Sektion zuerst, danach nur die **neuen** Findings). Weder neue
+  Findings noch offene PRs → **kein** Versand (nur Log), kein Spam.
+- Bei nur offenen PRs ohne neue Findings kommt eine kurze Nachricht mit
+  ausschließlich der Reminder-Sektion.
+
+**Ohne Fix-PRs** (`ENABLE_FIX_PRS!=1`) entsteht kein State und kein Reminder —
+Verhalten genau wie vor v1.1.0 (auch bei gesetztem `SKIP_REPOS`, das Repos nur
+vom Scan ausklammert).
+
+Lokaler Selbsttest (simuliertes State + PR-Status-Check gegen
+`mayraost/audit-scanner` mit nicht existierendem Fake-Branch, keine echten
+PRs, kein Telegram-Versand):
+
+```sh
+npm run build
+node dist/index.js state-test
+```
 
 ## LLM triage (optional)
 

@@ -23,6 +23,17 @@ import { ghBinary, ghStats } from './github.js';
 import { fetchAdvisories, GH_ECOSYSTEM, type AdvisoryHit } from './advisories.js';
 import { loadInventory, type Ecosystem, type RepoInfo } from './inventory.js';
 import { createFixPr, type FixFinding, type FixResult } from './fix-pr.js';
+import {
+  ageDays,
+  entriesForRepo,
+  isKnownFinding,
+  loadState,
+  reconcileRepo,
+  saveState,
+  upsertEntry,
+  type State,
+  type StateFinding,
+} from './state.js';
 import { sendTelegramReport } from './telegram.js';
 import { llmEnabled, triageFindings, type TriageDecision, type TriageInput } from './llm.js';
 
@@ -61,6 +72,15 @@ export interface RepoResult {
   fixPr?: FixResult;
 }
 
+export interface ReminderInfo {
+  repo: string;
+  prUrl: string;
+  prNumber: number;
+  ageDays: number;
+  createdAt: string;
+  findings: StateFinding[]; // offene CVEs (ghsaId + package) laut State-Eintrag
+}
+
 export interface Report {
   generatedAt: string;
   owner: string;
@@ -71,7 +91,9 @@ export interface Report {
     suppressed: number; // LLM-suppressed (decision suppress + conf >= 0.75)
     fixPrs: number;
     apiCalls: number;
+    reminders: number; // offene Fix-PRs (Reminder-Sektion)
   };
+  reminders: ReminderInfo[];
   repos: RepoResult[];
 }
 
@@ -95,6 +117,23 @@ interface TrivyResult {
 export async function runScan(opts: { sendTelegram: boolean; fixPrs: boolean }): Promise<Report> {
   const runDate = parseIsoDateKey();
   const inventory = await loadInventory();
+
+  // PR-Dedupe-State: nur aktiv, wenn Fix-PRs generell an sind (ENABLE_FIX_PRS=1).
+  // Ohne Fix-PRs bleibt Verhalten wie bisher (kein state.json, kein Reminder).
+  const state: State = opts.fixPrs ? loadState() : { prs: {} };
+  if (opts.fixPrs) {
+    // Je Repo mit State-Einträgen: PR-Remote-Status prüfen (geschlossene raus,
+    // offene lastSeen-Refresh) — einmal je Lauf, Basis für Reminder + Dedupe.
+    for (const repo of Object.keys(state.prs)) {
+      try {
+        await reconcileRepo(state, repo);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(`WARN: State-Reconciliation für ${repo} fehlgeschlagen: ${msg}`);
+      }
+    }
+    saveState(state);
+  }
 
   const results: RepoResult[] = [];
   const scanTmp = tmpRoot();
@@ -143,7 +182,9 @@ export async function runScan(opts: { sendTelegram: boolean; fixPrs: boolean }):
         const repoDir = await downloadTarball(scanTmp, repo);
         const trivyReport = await runTrivy(repo.name, repoDir, scanTmp);
         const nums = collectFindings(trivyReport, repo.ecosystem);
-        results.push(await finalizeRepoResult(res, nums, repo, opts.fixPrs, repoDir));
+        results.push(
+          await finalizeRepoResult(res, nums, repo, opts.fixPrs, repoDir, state)
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log(`WARN: Scan-Fehler für ${repo.name}: ${msg}`);
@@ -165,9 +206,14 @@ export async function runScan(opts: { sendTelegram: boolean; fixPrs: boolean }):
       suppressed: results.reduce((n, r) => n + r.findings.filter(isSuppressed).length, 0),
       fixPrs: results.filter((r) => r.fixPr?.status === 'created').length,
       apiCalls: ghStats.apiCalls,
+      reminders: collectReminders(state).length,
     },
+    reminders: collectReminders(state),
     repos: results,
   };
+
+  // State persistieren (lastSeen-Updates + ggf. neu angelegte PR-Einträge)
+  if (opts.fixPrs) saveState(state);
 
   // Report-Ablage + Heartbeat (auch wenn Telegram skip)
   const outDir = ensureDir(path.join(REPORTS_DIR, runDate));
@@ -187,7 +233,8 @@ async function finalizeRepoResult(
   raw: TrivyVuln[],
   repo: RepoInfo,
   fixPrsEnabledFlag: boolean,
-  repoDir: string
+  repoDir: string,
+  state: State
 ): Promise<RepoResult> {
   res.trivyIds = raw.length;
   res.status = 'scanned';
@@ -246,6 +293,22 @@ async function finalizeRepoResult(
   if (res.findings.length > 0 && llmEnabled()) await applyTriage(res);
 
   if (fixPrsEnabledFlag) {
+    // PR-Dedupe (State): Findings, für die bereits ein offener Fix-PR existiert,
+    // gelten nicht als "neu" — sie erscheinen nur in der Reminder-Sektion (Acknowledged).
+    // Suppressed Findings bleiben weiterhin in der suppressed-Sektion (bewusst verworfen).
+    if (entriesForRepo(state, res.name).length > 0) {
+      const before = res.findings.length;
+      res.findings = res.findings.filter(
+        (f) =>
+          isSuppressed(f) ||
+          !isKnownFinding(state, res.name, f.pkg, f.advisory?.ghsa ?? null)
+      );
+      const deduped = before - res.findings.length;
+      if (deduped > 0) {
+        log(`${res.name}: ${deduped} Finding(s) bereits durch offenen Fix-PR abgedeckt — nur Reminder.`);
+      }
+    }
+
     // Fix-PR: pro Advisory verwertbare Fix-Version (first_patched) zusammenfassen;
     // LLM-suppressed Findings (suppress + confidence >= 0.75) → aus PR ausgenommen
     const findings = new Map<string, FixFinding>();
@@ -272,11 +335,76 @@ async function finalizeRepoResult(
       }
     }
     if (repo.ecosystem && findings.size > 0 && (res.trivyIds ?? 0) > 0) {
-      res.fixPr = await createFixPr(repo, repo.ecosystem, [...findings.values()]);
+      const fixFindings = [...findings.values()];
+      res.fixPr = await createFixPr(repo, repo.ecosystem, fixFindings);
+      recordFixPrInState(state, res.name, res.fixPr, fixFindings);
     }
   }
 
   return res;
+}
+
+/**
+ * Fix-PR-Ergebnis in state.json verbuchen:
+ * - 'created': neuer State-Eintrag (Phasen-Branch, prUrl/prNumber, Findings).
+ * - 'exists': PR war offen aber (noch) nicht im State (z. B. nach corrupt-Reset)
+ *   → Rebuild-from-GitHub: Eintrag nachbilden.
+ */
+function recordFixPrInState(
+  state: State,
+  repo: string,
+  fixPr: FixResult,
+  findings: FixFinding[]
+): void {
+  if (!fixPr.prUrl || fixPr.prNumber === undefined || !fixPr.branch) return;
+  if (fixPr.status !== 'created' && fixPr.status !== 'exists') return;
+
+  const now = new Date().toISOString();
+  const stateFindings: StateFinding[] = [];
+  const ghsaIds: string[] = [];
+  for (const f of findings) {
+    if (f.ghsas.length === 0) {
+      stateFindings.push({ package: f.pkg, version: f.version, severity: f.severity, ghsaId: null });
+    }
+    for (const ghsa of f.ghsas) {
+      ghsaIds.push(ghsa);
+      stateFindings.push({ package: f.pkg, version: f.version, severity: f.severity, ghsaId: ghsa });
+    }
+  }
+
+  const existing = entriesForRepo(state, repo).find((e) => e.prNumber === fixPr.prNumber);
+  if (existing) {
+    existing.lastSeen = now;
+    return;
+  }
+  upsertEntry(state, repo, {
+    branch: fixPr.branch!,
+    prUrl: fixPr.prUrl,
+    prNumber: fixPr.prNumber,
+    ghsaIds,
+    createdAt: now,
+    lastSeen: now,
+    findings: stateFindings,
+  });
+  log(`${repo}: Fix-PR #${fixPr.prNumber} im State erfasst (${fixPr.status}).`);
+}
+
+/** Offene Fix-PRs aus dem reconciled State → Reminder-Infos (Alt in Tagen). */
+function collectReminders(state: State, now = new Date()): ReminderInfo[] {
+  const out: ReminderInfo[] = [];
+  for (const [repo, entries] of Object.entries(state.prs)) {
+    for (const entry of entries) {
+      out.push({
+        repo,
+        prUrl: entry.prUrl,
+        prNumber: entry.prNumber,
+        ageDays: ageDays(entry, now),
+        createdAt: entry.createdAt,
+        findings: entry.findings,
+      });
+    }
+  }
+  return out.sort((a, b) => a.repo.localeCompare(b.repo) || b.createdAt.localeCompare(a.createdAt));
 }
 
 /** devOnly je Finding aus package.json am Repo-Root bestimmen. */
@@ -393,7 +521,8 @@ function renderMarkdown(report: Report): string {
   const summaryLine =
     `*Repos*: ${report.summary.reposTotal} total / ${report.summary.scanned} gescannt · ` +
     `high/critical-Advisory-Funde: ${report.summary.findings} · LLM-suppressed: ${report.summary.suppressed} · ` +
-    `Fix-PRs: ${report.summary.fixPrs} · GitHub-API-Calls: ${report.summary.apiCalls}`;
+    `Fix-PRs: ${report.summary.fixPrs} · offene Fix-PRs (Reminder): ${report.summary.reminders} · ` +
+    `GitHub-API-Calls: ${report.summary.apiCalls}`;
   const lines: string[] = [
     `# CVE-Audit-Report (mayraost)`,
     '',
@@ -401,6 +530,16 @@ function renderMarkdown(report: Report): string {
     summaryLine,
     '',
   ];
+  if (report.reminders.length > 0) {
+    lines.push('## ⏰ Offene CVEs (Fix-PR wartet)', '');
+    for (const rem of report.reminders) {
+      lines.push(`### ${rem.repo} — Tag ${rem.ageDays}, offen seit ${rem.createdAt.slice(0, 10)}`);
+      for (const f of rem.findings) {
+        lines.push(`- ${f.ghsaId ?? '(trivy-only)'} ${f.package}@${f.version} [${f.severity}]`);
+      }
+      lines.push('', `PR: ${rem.prUrl}`, '');
+    }
+  }
   for (const r of report.repos) {
     lines.push(`## ${r.name}${r.private ? ' (private)' : ''} — ${r.status}`);
     if (r.note) lines.push(`*Hinweis*: ${r.note}`);
@@ -431,19 +570,50 @@ function renderMarkdown(report: Report): string {
 
 async function sendTelegramFromReport(report: Report): Promise<void> {
   const date = parseIsoDateKey(new Date(report.generatedAt));
+  const hasNew = report.repos.some((r) => r.findings.some((f) => !isSuppressed(f)));
+  const hasReminders = report.reminders.length > 0;
+  if (!hasNew && !hasReminders) {
+    // Keine neuen Funde UND keine offenen Fix-PRs → gar kein Versand (kein Spam).
+    log('Telegram skip: keine neuen Findings und keine offenen Fix-PRs — kein Versand.');
+    return;
+  }
   const title = `🔐 CVE-Audit ${date} (mayraost)`;
-  const body = telegramBody(report);
+  const body = telegramBody(report, hasNew);
   await sendTelegramReport(title, body);
 }
 
-function telegramBody(report: Report): string {
+/** Reminder-Sektion: offene Fix-PRs mit Alter in Tagen + offene CVEs (kompakt). */
+function reminderLines(report: Report): string[] {
+  const lines: string[] = [];
+  for (const rem of report.reminders) {
+    lines.push(`⏰ Offene CVEs (Fix-PR wartet, Tag ${rem.ageDays}): *${rem.repo}*`);
+    for (const f of rem.findings) {
+      const ghsa = f.ghsaId ?? 'trivy-only';
+      lines.push(`  • ${ghsa} ${f.package}@${f.version} [${f.severity}]`);
+    }
+    lines.push(`  🛠 PR offen: ${rem.prUrl}`);
+    lines.push('');
+  }
+  if (lines.length > 0 && lines.at(-1) === '') lines.pop();
+  return lines;
+}
+
+function telegramBody(report: Report, hasNewFindings: boolean): string {
   const lines: string[] = [];
   const totalCount = report.repos.reduce((n, r) => n + r.findings.length, 0);
   const suppressedCount = report.repos.reduce((n, r) => n + r.findings.filter(isSuppressed).length, 0);
   const withFinds = report.repos.filter((r) => r.findings.some((f) => !isSuppressed(f)));
 
+  // Reminder-Sektion IMMER zuerst (JEDEN Lauf mit offenen Fix-PRs, auch ohne neue Funde);
+  // dedupete alte Findings erscheinen NUR hier, nicht doppelt in der Finding-Sektion.
+  lines.push(...reminderLines(report));
+
+  if (!hasNewFindings) {
+    // Nur-Reminder-Nachricht (kurz) — keine weiteren Sektionen.
+    return lines.join('\n\n');
+  }
   if (withFinds.length === 0) {
-    lines.push('✅ Keine high/critical-Security-Advisories gefunden.');
+    lines.push('✅ Keine neuen high/critical-Security-Advisories gefunden.');
   }
   for (const r of withFinds) {
     const visible = r.findings.filter((f) => !isSuppressed(f));

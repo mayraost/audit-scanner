@@ -31,6 +31,7 @@ export interface FixFinding {
 export interface FixResult {
   status: 'created' | 'exists' | 'skipped' | 'failed';
   prUrl?: string;
+  prNumber?: number;
   branch?: string;
   bumped?: string[];
   note?: string;
@@ -69,7 +70,7 @@ export async function createFixPr(
   try {
     // Offenen PR zur Branch-ID checken (Dedupe, auch wenn Branch schon existiert)
     const existing = await findOpenPr(repo.name, branch);
-    if (existing) return { status: 'exists', prUrl: existing, branch };
+    if (existing) return { status: 'exists', prUrl: existing.url, prNumber: existing.number, branch };
 
     // Base-SHA (Default-Branch-Head) ermitteln + Branch anlegen (idempotent)
     const ref = await ghJson<{ object: { sha: string } }>(
@@ -78,7 +79,7 @@ export async function createFixPr(
     const created = await tryCreateRef(repo.name, branch, ref.object.sha);
     if (created === 'ref-exists') {
       const openNow = await findOpenPr(repo.name, branch);
-      if (openNow) return { status: 'exists', prUrl: openNow, branch };
+      if (openNow) return { status: 'exists', prUrl: openNow.url, prNumber: openNow.number, branch };
       log(`Fix-PR ${repo.name}: Branch ${branch} existiert ohne offenen PR — update fort.`);
     }
 
@@ -143,7 +144,7 @@ export async function createFixPr(
         }),
       }
     );
-    return { status: 'created', prUrl: pr.html_url, branch, bumped };
+    return { status: 'created', prUrl: pr.html_url, prNumber: pr.number, branch, bumped };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log(`WARN: Fix-PR für ${repo.name} fehlgeschlagen: ${msg}`);
@@ -151,11 +152,11 @@ export async function createFixPr(
   }
 }
 
-async function findOpenPr(repo: string, branch: string): Promise<string | null> {
-  const prs = await ghJsonOrNull<Array<{ html_url: string }>>(
+async function findOpenPr(repo: string, branch: string): Promise<{ url: string; number: number } | null> {
+  const prs = await ghJsonOrNull<Array<{ html_url: string; number: number }>>(
     `/repos/${OWNER}/${repo}/pulls?state=open&head=${OWNER}:${encodeURIComponent(branch)}`
   );
-  return prs && prs.length > 0 ? prs[0]!.html_url : null;
+  return prs && prs.length > 0 ? { url: prs[0]!.html_url, number: prs[0]!.number } : null;
 }
 
 async function tryCreateRef(

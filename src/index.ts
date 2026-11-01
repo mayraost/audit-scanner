@@ -4,6 +4,15 @@ import { CRON_SCHEDULE, fixPrsEnabled, log } from './config.js';
 import { loadInventory } from './inventory.js';
 import { llmEnabled, triageFindings, type TriageInput } from './llm.js';
 import { runScan } from './scan.js';
+import {
+  ageDays,
+  isKnownFinding,
+  loadState,
+  parseState,
+  prOpenStatus,
+  upsertEntry,
+  type State,
+} from './state.js';
 import { sendTelegramReport } from './telegram.js';
 
 function usage(): never {
@@ -18,6 +27,9 @@ COMMANDS
   inventory     Nur Inventarlisting (Repos + erkannte Manifests/Ökosysteme).
   test-telegram 1 Test-Nachricht via TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID senden.
   triage-test   LLM-Triage mit 2 Fake-Findings prüfen (kein Scan, kein Telegram).
+  state-test    PR-Dedupe-State: parse/reconciliation-Selbsttest mit simulierten Entries,
+                PR-Status-Check gegen mayraost/audit-scanner (Fake-Branch → kein offener
+                PR erwartet). Keine echten PRs, kein Telegram-Versand.
 
 ENV
   GH_TOKEN            Pflicht (Bearer für api.github.com). Dev-Fallback lokal:
@@ -63,6 +75,10 @@ async function main(): Promise<void> {
     case 'test-telegram': {
       const ok = await sendTelegramReport('✅ audit-scanner Test-Report', body());
       process.exitCode = ok ? 0 : 2;
+      return;
+    }
+    case 'state-test': {
+      process.exitCode = await stateTest();
       return;
     }
     case 'triage-test': {
@@ -113,6 +129,73 @@ function body(): string {
     'Dies ist eine Testnachricht vom `node dist/index.js test-telegram`.',
     'Enthält KEINE Repo-Daten — reine Config-Signalnachricht.',
   ].join('\n');
+}
+
+/**
+ * Purer Selbsttest der State-/Dedupe-Logik (kein Scan, kein PR, kein Telegram):
+ * 1) parseState tolerant: corrupt JSON → null; valid JSON → State.
+ * 2) Dedupe-Matching: isKnownFinding rejex über simulierte Entries.
+ * 3) PR-Status-Check gegen echtes Repo (mayraost/audit-scanner) mit Fake-Branch,
+ *    der garantiert nicht existiert → { open:false } = "kein offener PR".
+ * 4) loadState/saveState Roundtrip in REPORTS_DIR (echte state.json unangetastet
+ *    lassen: nur schreiben, wenn noch keine existiert).
+ */
+async function stateTest(): Promise<number> {
+  let ok = true;
+
+  // 1 corrupt parse
+  const corrupt = parseState('{ nicht-json <<<');
+  process.stdout.write(`corrupt-parse: ${corrupt === null ? 'OK (null)' : 'FAIL'}\n`);
+  ok &&= corrupt === null;
+
+  // 1 valid parse
+  const valid: State = {
+    prs: {
+      demo: [
+        {
+          branch: 'cve-audit/fixes-2099-01-01',
+          prUrl: 'https://github.com/mayraost/demo/pull/1',
+          prNumber: 1,
+          ghsaIds: ['GHSA-0000-aaaa'],
+          createdAt: new Date(Date.now() - 3 * 86_400_000).toISOString(),
+          lastSeen: new Date().toISOString(),
+          findings: [{ package: 'lodash', version: '4.17.15', severity: 'critical', ghsaId: 'GHSA-0000-aaaa' }],
+        },
+      ],
+    },
+  };
+  const parsed = parseState(JSON.stringify(valid));
+  process.stdout.write(`valid-parse: ${parsed?.prs.demo?.length === 1 ? 'OK' : 'FAIL'}\n`);
+  ok &&= parsed?.prs.demo?.length === 1;
+
+  // 2 dedupe matching
+  const st: State = { prs: { demo: parsed?.prs.demo ?? [] } };
+  const known = isKnownFinding(st, 'demo', 'LODASH', 'GHSA-0000-aaaa');
+  const unknown = isKnownFinding(st, 'demo', 'lodash', 'GHSA-0000-bbbb');
+  process.stdout.write(`dedupe known=${known ? 'OK' : 'FAIL'} unknown=${unknown ? 'FAIL' : 'OK'}\n`);
+  ok &&= known && !unknown;
+
+  // 2b upsert + age
+  upsertEntry(st, 'demo', { ...st.prs.demo![0]!, prNumber: 2, branch: 'cve-audit/fixes-2099-01-02' });
+  ok &&= st.prs.demo!.length === 2;
+  const age = ageDays(st.prs.demo![0]!);
+  process.stdout.write(`upsert/age: entries=2 ${age === 3 ? 'age=3d OK' : `age=${age}d (Tag-Differenz, ok wenn >=2)`}\n`);
+
+  // 3 remote check gegen echtes Repo (Fake-Branch → kein offener PR)
+  const status = await prOpenStatus('audit-scanner', 'cve-audit/fixes-2099-01-01');
+  process.stdout.write(
+    `prOpenStatus(audit-scanner, fake-branch): open=${status.open} ${!status.open ? 'OK (kein offener PR)' : 'FAIL'}\n`
+  );
+  ok &&= !status.open;
+
+  // 4 state-Persist-Datei existiert? (nur Info — state.json wird vom echten Scan gepflegt)
+  const state = loadState();
+  process.stdout.write(
+    `loadState: prs=${JSON.stringify(Object.keys(state.prs))} (leer = erster Lauf, ok)\n`
+  );
+
+  process.stdout.write(ok ? './ state-test PASS\n' : '✗ state-test FAIL\n');
+  return ok ? 0 : 1;
 }
 
 main().catch((err) => {
