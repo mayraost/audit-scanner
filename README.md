@@ -34,7 +34,10 @@ keine Ports, keine Domain, reiner Batch-Job.
    `⚠️ keine gepatchte Version`. Bereits offene PRs desselben Branches werden erkannt statt
    dupliziert — und via `reports/state.json` tagesübergreifend dedupliziert
    (siehe „Reminder & PR dedupe“).
-6. **Heartbeat**: Nach jedem Scan-Lauf wird `/app/reports/.heartbeat`
+6. **Image-Scan** (seit v1.4.0): alle Dockerfiles (`FROM`, `COPY/ADD --from`)
+   und Compose-`image:`-Felder eines Repos parsen → `trivy image` ohne Docker-
+   Daemon + Major-Freshness-Check. Details unten („🐳 Image-Scan“).
+7. **Heartbeat**: Nach jedem Scan-Lauf wird `/app/reports/.heartbeat`
    getoucht — Docker-HEALTHCHECK akzeptiert Alter < 48 h (Cron-Skip-Toleranz).
 
 ## Setup
@@ -70,7 +73,13 @@ Umgebungsvariable in Coolify (bzw. lokal in eine nicht-committete `.env`).
 | `TELEGRAM_BOT_TOKEN` | nein    | —             | Ohne = kein Telegram-Versand (Scan läuft trotzdem). |
 | `TELEGRAM_CHAT_ID`   | nein    | —             | Ziel-Chat (User-ID oder Group-ID). |
 | `ENABLE_FIX_PRS`     | nein    | `0`           | `1`/`true` = Auto-Fix-PRs anlegen. |
-| `SKIP_REPOS`         | nein    | —             | Kommagetrennte Repo-Namen, z. B. `archive,playground`. |
+| `SKIP_REPOS`         | nein    | *(leer)*      | Kommagetrennte Repo-Namen als Skip-Liste. Default leer = alle Repos scannen (auch `audit-scanner` selbst → self-scan). |
+
+Archivierte Repos (GitHub `archived=true`) werden **immer übersprungen**
+(hard guard `skipped-archived`, kein Scan, kein Fix-PR) — unabhängig von
+`SKIP_REPOS` oder `.cve-audit-skip`. Das Ergebnis im Report erscheint als
+`skip(archived)`; archivierte Repos sind bewusst eingefroren und brauchen
+weder Advisories noch Image-Updates.
 | `CRON_SCHEDULE`      | nein    | `0 16 * * *`  | Cron in Container-Zeit (TZ=Europe/Berlin → 16:00 Ortszeit). |
 |  *(keine neuen Variablen für Reminder/Dedupe — aktiviert sich mit `ENABLE_FIX_PRS=1` automatisch)* | | | |
 | `DEEPINFRA_API_KEY`  | nein    | —             | LLM-Triage (siehe „LLM triage (optional)“). Ohne = `LLM disabled`, Scanner läuft deterministisch weiter. |
@@ -99,7 +108,8 @@ Seit v1.1.0 führt der Scanner einen persistenten PR-State
         "lastSeen": "2026-11-01T16:00:03.000Z",
         "findings": [
           { "package": "lodash", "version": "4.17.15", "severity": "critical", "ghsaId": "GHSA-xxxx-yyyy" }
-        ]
+        ],
+        "kind": "cve"     // 'cve' (Default) oder 'image' (Image-Tag-Bump-PR)
       }
     ]
   }
@@ -183,6 +193,48 @@ Test (2 Fake-Findings, kein Scan/Telegram):
 ```sh
 node dist/index.js triage-test
 ```
+
+## 🐳 Image-Scan (Dockerfile / compose, seit v1.4.0)
+
+Nach dem Tarball-Parsen wird jedes Repo gefiltert nach Docker-Image-Quellen:
+
+- **Dockerfile** (alle Varianten `Dockerfile`, `Dockerfile.<name>`): alle
+  `FROM <ref>` inkl. BuildKit-Flags (`--platform=…`) und `COPY/ADD --from=<ref>`
+  — Stage-Namen (`AS builder`) und numerische Stage-Indizes werden ausgeschlossen
+  (sind keine Images). `FROM scratch`/Variable-Refs → Skip mit Note.
+- **`docker-compose.yml`/`compose.yaml`**: alle `image:`-Felder (Zeilen-Regex,
+  robust gegen Inline-Kommentare/Quotes).
+
+Je Repo dedupliziert (Ref über alle Files gemerged), dann:
+
+1. **`trivy image`** ohne Docker-Daemon — die Registry-API wird direkt
+   angetaktet (DB teilt denselben `/app/.cache/trivy`-Cache). Nur
+   `HIGH`/`CRITICAL` zählen. **Private/404-Images** → graceful skip im Report
+   mit Note statt Hard-Fail.
+2. **Freshness-Check** je Image-Ref: Registry-Tag-Liste
+   (Docker Hub via `auth.docker.io`-Token-Flow, GHCR analog; Paginierung bis
+   2 Seiten) → neuester **gepinnter Tag im selben Major** (`24-alpine` → alle
+   `24.*-…`, Prefer gleiche `-alpine`-Varianten). Pre-Releases
+   (`-alpha/-beta/-rc/-dev`) ausgeschlossen. Digest-pinned / `latest` /
+   Tag-less / `$VAR`-Refs → Skip mit Note.
+3. **Fix-PR-Policy (nur exakte Pins)**: Tags mit Format `x.y.z` (z. B.
+   `aquasec/trivy:0.76.1`) und verfügbarer streng neuerer Version im selben
+   Major → Branch `cve-audit/images-<YYYY-MM-DD>`, Tag-Bump via [`contents`
+   PUT] je Quelldatei, PR mit deterministischem Body (kein LLM).
+   **Floating-Tags** (z. B. `node:24-alpine`) bekommen **keinen** PR — sie
+   zeigen bereits auf den neuesten Match des Major bei jedem Rebuild. Der
+   Report zeigt je Image `⚠️ update verfügbar` bzw. `floating
+   (aktualisiert sich beim Rebuild)`.
+4. **Report/Telegram**: Sektion `🐳 Images` je Repo (Image | current | newest |
+   Vulns H/C | Status); Image-PRs zählen als eigene `imagePrs`-Summary
+   (`Fix-PRs diesmal: … // 🐳 Image-Bump-PRs diesmal: …`).
+
+Andere Registries (`gcr.io`, `quay.io`, `registry.k8s.io`, …) werden von trivy
+gescannt, aber der **Freshness-Check** bleibt Docker Hub + GHCR vorbehalten
+(Note im Report markiert den Skip).
+
+`reports/state.json` kennt für Image-PRs einen Eintrag mit `kind: "image"`,
+der NICHT in der CVE-Reminder-Sektion auftaucht (kurzlebig, kein CVE-Tracking).
 
 ## Coolify-Deployment
 

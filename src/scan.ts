@@ -23,6 +23,7 @@ import { ghBinary, ghStats } from './github.js';
 import { fetchAdvisories, GH_ECOSYSTEM, type AdvisoryHit } from './advisories.js';
 import { loadInventory, MANIFEST_MAP, type Ecosystem, type RepoInfo } from './inventory.js';
 import { createFixPr, type FixFinding, type FixResult } from './fix-pr.js';
+import { createImagePr, scanRepoImages, type ImageFinding } from './image-scan.js';
 import {
   ageDays,
   entriesForRepo,
@@ -75,6 +76,9 @@ export interface RepoResult {
   trivyIds?: number; // high/critical-rohfunde aus trivy
   findings: PackageFinding[];
   fixPr?: FixResult;
+  /** Image-Scan (Dockerfile/compose): Refs, vulns, Freshness (v1.4.0). */
+  images?: ImageFinding[];
+  imagePr?: FixResult;
 }
 
 export interface ReminderInfo {
@@ -95,6 +99,7 @@ export interface Report {
     findings: number;
     suppressed: number; // LLM-suppressed (decision suppress + conf >= 0.75)
     fixPrs: number;
+    imagePrs: number; // Image-Tag-Bump-PRs (separate section, fixPrs-Umgebung)
     apiCalls: number;
     reminders: number; // offene Fix-PRs (Reminder-Sektion)
   };
@@ -210,6 +215,18 @@ export async function runScan(opts: {
         results.push(
           await finalizeRepoResult(res, nums, repo, opts.fixPrs, repoDir, state)
         );
+        // Image-Scan (v1.4.0): Dockerfiles/compose parsen → trivy image (ohne
+        // daemon) + Freshness; optional Image-Tag-Bump-PR (nur pinned, immer-PR).
+        try {
+          const img = await scanRepoImages(repo, repoDir, scanTmp, trivyAvailable);
+          res.images = img.findings;
+          if (opts.fixPrs && img.bumpPlan.length > 0) {
+            res.imagePr = await createImagePr(repo, img.bumpPlan);
+          }
+        } catch (ierr) {
+          const imsg = ierr instanceof Error ? ierr.message : String(ierr);
+          log(`WARN: Image-Scan für ${repo.name} fehlgeschlagen: ${imsg}`);
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log(`WARN: Scan-Fehler für ${repo.name}: ${msg}`);
@@ -230,6 +247,7 @@ export async function runScan(opts: {
       findings: results.reduce((n, r) => n + r.findings.length, 0),
       suppressed: results.reduce((n, r) => n + r.findings.filter(isSuppressed).length, 0),
       fixPrs: results.filter((r) => r.fixPr?.status === 'created').length,
+      imagePrs: results.filter((r) => r.imagePr?.status === 'created').length,
       apiCalls: ghStats.apiCalls,
       reminders: collectReminders(state).length,
     },
@@ -449,6 +467,7 @@ function collectReminders(state: State, now = new Date()): ReminderInfo[] {
   const out: ReminderInfo[] = [];
   for (const [repo, entries] of Object.entries(state.prs)) {
     for (const entry of entries) {
+      if (entry.kind === 'image') continue; // Image-PRs sind keine CVE-Reminder
       out.push({
         repo,
         prUrl: entry.prUrl,
@@ -579,7 +598,7 @@ function renderMarkdown(report: Report): string {
   const summaryLine =
     `*Repos*: ${report.summary.reposTotal} total / ${report.summary.scanned} gescannt · ` +
     `high/critical-Advisory-Funde: ${report.summary.findings} · LLM-suppressed: ${report.summary.suppressed} · ` +
-    `Fix-PRs: ${report.summary.fixPrs} · offene Fix-PRs (Reminder): ${report.summary.reminders} · ` +
+    `Fix-PRs: ${report.summary.fixPrs}${report.summary.imagePrs ? ` (+${report.summary.imagePrs} Image)` : ''} · offene Fix-PRs (Reminder): ${report.summary.reminders} · ` +
     `GitHub-API-Calls: ${report.summary.apiCalls}`;
   const lines: string[] = [
     `# CVE-Audit-Report (mayraost)`,
@@ -621,14 +640,42 @@ function renderMarkdown(report: Report): string {
       }
     }
     if (r.fixPr?.prUrl) lines.push('', `Fix-PR: ${r.fixPr.prUrl} (${r.fixPr.status})`);
+    if (r.imagePr?.prUrl) lines.push('', `Image-PR: ${r.imagePr.prUrl} (${r.imagePr.status})`);
+    if (r.images?.length) lines.push('', imageTable(r.images));
     lines.push('');
   }
   return lines.join('\n');
 }
 
+/** 🐳-Sektion je Repo (Report-MD): nur Images mit vulns/update/note. */
+function imageTable(images: ImageFinding[]): string {
+  const rows: string[] = [];
+  for (const f of images) {
+    const vc = `H${f.vulns.high}/C${f.vulns.critical}`;
+    if (f.note) {
+      rows.push(`| ${f.image} | — | — | — | ${f.note} |`);
+    } else if (f.updateAvailable) {
+      rows.push(`| ${f.image} | ${f.current} | ${f.newestSameMajor} | ${vc} | ⚠️ update verfügbar |`);
+    } else {
+      rows.push(
+        `| ${f.image} | ${f.current} | ${f.newestSameMajor ?? '—'} | ${vc} | ` +
+          (f.pinned ? 'aktuell' : 'floating (aktualisiert sich beim Rebuild)') + ' |'
+      );
+    }
+  }
+  return [
+    '### 🐳 Images (Dockerfile/compose)',
+    '| Image | Current | Newest same-major | Vulns H/C | Status |',
+    '|---|---|---|---|---|',
+    ...rows,
+  ].join('\n');
+}
+
 async function sendTelegramFromReport(report: Report): Promise<void> {
   const date = parseIsoDateKey(new Date(report.generatedAt));
-  const hasNew = report.repos.some((r) => r.findings.some((f) => !isSuppressed(f)));
+  const hasNew =
+    report.repos.some((r) => r.findings.some((f) => !isSuppressed(f))) ||
+    report.repos.some((r) => r.images?.some((i) => i.updateAvailable) ?? false);
   const hasReminders = report.reminders.length > 0;
   if (!hasNew && !hasReminders) {
     // Keine neuen Funde UND keine offenen Fix-PRs → gar kein Versand (kein Spam).
@@ -690,6 +737,29 @@ function telegramBody(report: Report, hasNewFindings: boolean): string {
   if (suppressedCount > 0) {
     lines.push(`🔇 LLM-suppressed: ${suppressedCount}/${totalCount} Funde (Details im Report „LLM-suppressed“-Sektion).`);
   }
+  // 🐳 Image-Sektion: nur Repos mit Image-Refs und zumindest vulns>0 oder Update.
+  const imgRepos = report.repos.filter(
+    (r) => r.images?.some((i) => !i.note && (i.updateAvailable || i.vulns.high + i.vulns.critical > 0))
+  );
+  if (imgRepos.length > 0) {
+    lines.push('🐳 Image-Scan (Dockerfile/compose):');
+    for (const r of imgRepos) {
+      lines.push(`*${r.name}*:`);
+      for (const f of r.images!) {
+        if (f.note || (!f.updateAvailable && f.vulns.high + f.vulns.critical === 0)) continue;
+        const vc = `H${f.vulns.high}/C${f.vulns.critical}`;
+        if (f.updateAvailable) {
+          lines.push(`  • ${f.image} → ${f.newestSameMajor} ⚠️ update verfügbar [${vc}]`);
+        } else {
+          lines.push(
+            `  • ${f.image} [${vc}] — ${f.pinned ? 'pinned, aktuell' : 'floating (Rebuild aktualisiert)'}`
+          );
+        }
+      }
+      if (r.imagePr?.prUrl) lines.push(`  🛠 Image-PR: ${r.imagePr.prUrl}`);
+      lines.push('');
+    }
+  }
   const unscannable = report.repos.filter(
     (r) => r.status.startsWith('skipped') || r.status === 'error' || r.status === 'trivy-missing'
   );
@@ -702,6 +772,10 @@ function telegramBody(report: Report, hasNewFindings: boolean): string {
   const fixed = report.repos.filter((r) => r.fixPr?.status === 'created');
   if (fixed.length > 0) {
     lines.push(`Fix-PRs diesmal: ${fixed.map((r) => r.name).join(', ')}`);
+  }
+  const imgFixed = report.repos.filter((r) => r.imagePr?.status === 'created');
+  if (imgFixed.length > 0) {
+    lines.push(`🐳 Image-Bump-PRs diesmal: ${imgFixed.map((r) => r.name).join(', ')}`);
   }
   return lines.join('\n\n');
 }

@@ -25,6 +25,8 @@ export interface PrEntry {
   createdAt: string; // ISO
   lastSeen: string; // ISO — letzter Lauf, in dem der PR noch offen war
   findings: StateFinding[];
+  /** PR-Art: 'cve' (Default, CVE-Fix) oder 'image' (Image-Tag-Bump). */
+  kind?: 'cve' | 'image';
 }
 
 export interface State {
