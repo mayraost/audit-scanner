@@ -266,6 +266,7 @@ npm run build          # tsc → dist/
 node dist/index.js inventory      # Inventarlisting (Repos + Ökosysteme)
 node dist/index.js scan           # voller Durchlauf (Scan + Telegram + Fix-PRs)
 node dist/index.js scan --only=private-ai-interface   # Probe-Lauf: nur dieses Repo
+                # → Report suffixed (report.only-…md), Tages-Report unangetastet
 node dist/index.js test-telegram  # 1 Config-Testnachricht an Telegram
 ```
 
