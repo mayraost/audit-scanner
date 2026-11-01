@@ -25,7 +25,8 @@ COMMANDS
                 Fix-PRs nur mit ENABLE_FIX_PRS=1; Repos via SKIP_REPOS oder
                 repo-lokaler Datei .cve-audit-skip ausklammerbar.
                 scan --only=repo1,repo2: nur diese Repos scannen (Probe-Lauf,
-                Full-Scan-Zeit sparen; state/Telegram-Flow unverändert).
+                Full-Scan-Zeit sparen; Report suffixed als report.only-<repos>.md
+                — Tages-Full-Report unangetastet; state/Telegram-Flow unverändert).
   inventory     Nur Inventarlisting (Repos + erkannte Manifests/Ökosysteme).
   test-telegram 1 Test-Nachricht via TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID senden.
   triage-test   LLM-Triage mit 2 Fake-Findings prüfen (kein Scan, kein Telegram).

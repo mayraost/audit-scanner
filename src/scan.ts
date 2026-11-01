@@ -258,13 +258,15 @@ export async function runScan(opts: {
   // State persistieren (lastSeen-Updates + ggf. neu angelegte PR-Einträge)
   if (opts.fixPrs) saveState(state);
 
-  // Report-Ablage + Heartbeat (auch wenn Telegram skip)
+  // Report-Ablage + Heartbeat (auch wenn Telegram skip). --only-Run (Probe-Lauf)
+  // bekommt suffixed Report-Files — Tages-Full-Scan-Report bleibt unangetastet.
   const outDir = ensureDir(path.join(REPORTS_DIR, runDate));
-  fs.writeFileSync(path.join(outDir, 'report.json'), JSON.stringify(report, null, 2));
-  fs.writeFileSync(path.join(outDir, 'report.md'), renderMarkdown(report));
+  const suffix = opts.onlyRepos && opts.onlyRepos.length > 0 ? onlyReportSuffix(opts.onlyRepos) : '';
+  fs.writeFileSync(path.join(outDir, `report${suffix}.json`), JSON.stringify(report, null, 2));
+  fs.writeFileSync(path.join(outDir, `report${suffix}.md`), renderMarkdown(report));
   ensureDir(REPORTS_DIR);
   fs.writeFileSync(HEARTBEAT_FILE, new Date().toISOString());
-  log(`Report geschrieben: ${outDir}`);
+  log(`Report geschrieben: ${outDir}${suffix ? ` (report${suffix}.* — --only-Run, Full-Scan-Report unangetastet)` : ''}`);
 
   if (opts.sendTelegram) await sendTelegramFromReport(report);
   return report;
@@ -592,6 +594,22 @@ function collectFindings(report: TrivyResult): TrivyVuln[] {
     seen.add(key);
     return true;
   });
+}
+
+/**
+ * Dateisystem-sicherer Report-File-Suffix für --only-Runs (Probe-Lauf):
+ * Repos zu einem stabilen Tag normalisieren (z. B. ["private-ai-interface"]
+ * → ".only-private-ai-interface", mehrere: "-joined", gekürzt auf 60 Zeichen).
+ * Tages-Report (report.md/json) bleibt dadurch vom Full-Scan unangetastet.
+ */
+function onlyReportSuffix(repos: string[]): string {
+  const tag = repos
+    .map((r) => r.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, ''))
+    .filter(Boolean)
+    .join('-')
+    .slice(0, 60)
+    .replace(/-+$/g, '');
+  return tag.length > 0 ? `.only-${tag}` : '.only';
 }
 
 function renderMarkdown(report: Report): string {
