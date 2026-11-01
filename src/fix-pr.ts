@@ -14,6 +14,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
+import semver from 'semver';
+
 import { OWNER, log, parseIsoDateKey } from './config.js';
 import { b64, decodeB64, ghFetch, ghJson, ghJsonOrNull } from './github.js';
 import { generatePrBodyCveSections } from './llm.js';
@@ -104,6 +106,17 @@ export async function createFixPr(
       'chore(cve-audit): bump vulnerable dependencies [skip ci]'
     );
 
+    // pnpm >= 12 liest pnpm.overrides aus package.json NICHT mehr ("The pnpm field
+    // is no longer read") → overrides als top-level Block in pnpm-workspace.yaml.
+    let workspaceYaml: string | null = null;
+    if (lockfileEcosystem === 'pnpm' && overridesAdded.length > 0) {
+      try {
+        workspaceYaml = await renderPnpmWorkspaceOverrides(repo.name, branch, parseOverridesAdded(overridesAdded));
+      } catch (err) {
+        log(`Fix-PR ${repo.name}: pnpm-workspace.yaml-Update fehlgeschlagen: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
     // Lockfile regenerieren und pushen (nur wenn geändert)
     let lockNote: string | null = null;
     const lockPath = lockfilePath(lockfileEcosystem, repo.lockedPath);
@@ -115,7 +128,8 @@ export async function createFixPr(
         const regenerated = await regenerateLockfile(
           lockfileEcosystem,
           updatedPkg,
-          decodeB64(lockFile.content)
+          decodeB64(lockFile.content),
+          workspaceYaml !== null ? { 'pnpm-workspace.yaml': workspaceYaml } : undefined
         );
         if (regenerated.changed && regenerated.content !== undefined) {
           await putContent(
@@ -157,6 +171,80 @@ async function findOpenPr(repo: string, branch: string): Promise<{ url: string; 
     `/repos/${OWNER}/${repo}/pulls?state=open&head=${OWNER}:${encodeURIComponent(branch)}`
   );
   return prs && prs.length > 0 ? { url: prs[0]!.html_url, number: prs[0]!.number } : null;
+}
+
+/** "pkg → version"-Einträge aus overridesAdded zurück in eine Map zerlegen. */
+function parseOverridesAdded(entries: string[]): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const e of entries) {
+    const m = /^(.+?) → (.+)$/.exec(e);
+    if (m) map[m[1]!] = m[2]!;
+  }
+  return map;
+}
+
+/**
+ * overrides als top-level Block in pnpm-workspace.yaml rendern und ins Repo
+ * schreiben (pnpm >= 12: pnpm.overrides in package.json wird nicht mehr gelesen).
+ * Merge: existierende Einträge bleiben, neue überschreiben. Return: gerenderter
+ * YAML-Content (für das tmp-Dir des Lockfile-Regens). Überspringer-Fallback lämpt.
+ */
+async function renderPnpmWorkspaceOverrides(
+  repo: string,
+  branch: string,
+  ov: Record<string, string>
+): Promise<string> {
+  const file = await ghJsonOrNull<{ sha: string; content: string }>(
+    `/repos/${OWNER}/${repo}/contents/pnpm-workspace.yaml?ref=${encodeURIComponent(branch)}`
+  );
+  const text = file ? decodeB64(file.content) : '';
+  const updated = renderPnpmWorkspaceYaml(text, ov);
+
+  const res = await ghFetch(
+    `/repos/${OWNER}/${repo}/contents/pnpm-workspace.yaml?branch=${encodeURIComponent(branch)}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({
+        message: 'chore(cve-audit): pnpm overrides in pnpm-workspace.yaml [skip ci]',
+        content: b64(updated),
+        sha: file?.sha,
+        branch,
+      }),
+    }
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`pnpm-workspace.yaml PUT ${res.status}: ${body.slice(0, 200)}`);
+  }
+  return updated;
+}
+
+/** pnpm-workspace.yaml-Text mit gemergtem flachem overrides-Block neu rendern. */
+function renderPnpmWorkspaceYaml(text: string, ov: Record<string, string>): string {
+  // Existierende (flache) overrides-Einträge erfassen: Block `overrides:` bis zur
+  // nächsten top-level Zeile (kein Leading-Space) oder Dateiende.
+  const blockRe = /^overrides:\n((?:[ \t][^\n]*\n|[ \t]*\n)*)/m;
+  const m = blockRe.exec(text);
+  const existing: Record<string, string> = {};
+  if (m) {
+    for (const line of m[1]!.split('\n')) {
+      const e = /^[ \t]+("?)([^":\s]+)\1:[ \t]*("?)([^":\n]+)\3[ \t]*$/.exec(line);
+      if (e) existing[e[2]!] = e[4]!;
+    }
+  }
+  const merged = { ...existing, ...ov };
+
+  const block =
+    'overrides:\n' +
+    Object.keys(merged)
+      .sort()
+      .map((k) => `  "${k}": "${merged[k]}"\n`)
+      .join('');
+
+  if (m) {
+    return text.slice(0, m.index) + block + text.slice(m.index + m[0]!.length);
+  }
+  return text.replace(/\n*$/, '\n\n') + block;
 }
 
 async function tryCreateRef(
@@ -213,6 +301,19 @@ function applyBumps(
     if (directSection) {
       const dep = json[directSection] as Record<string, string>;
       const old = dep[f.pkg];
+      // Downgrade-Guard: first_patched kann unterhalb der installierten Version
+      // liegen (mehrgliedrige Advisory-Ranges) → kein Major-Rückwärts-Bump
+      // (z. B. mermaid ^11.4.1 → ^10.9.3). Stattdessen Finding überspringen.
+      const oldCoerced = old ? semver.coerce(old) : null;
+      const patchedCoerced = semver.coerce(patched);
+      if (
+        oldCoerced &&
+        patchedCoerced &&
+        semver.major(patchedCoerced) < semver.major(oldCoerced)
+      ) {
+        log(`Fix-PR: ${f.pkg} ${patched} < ${old} (Major-Downgrade) — übersprungen.`);
+        continue;
+      }
       // Versionsstil des Repos erhalten (^ / ~), sonst exakte gepatchte Version
       const target =
         old?.startsWith('^') === true
@@ -235,13 +336,10 @@ function applyBumps(
         overridesAdded.push(`${f.pkg} → ${target}`);
       }
     } else if (eco === 'pnpm') {
-      const pnpmObj = (json.pnpm ??= {}) as Record<string, unknown>;
-      const ov = (pnpmObj.overrides ??= {}) as Record<string, string>;
+      // pnpm >= 12: pnpm.overrides in package.json wird NICHT mehr gelesen →
+      // nur Auflistung; Block landet in pnpm-workspace.yaml (siehe createFixPr).
       const target = patched;
-      if (ov[f.pkg] !== target) {
-        ov[f.pkg] = target;
-        overridesAdded.push(`${f.pkg} → ${target}`);
-      }
+      overridesAdded.push(`${f.pkg} → ${target}`);
     }
   }
 
@@ -284,7 +382,8 @@ interface RegenResult {
 async function regenerateLockfile(
   eco: Ecosystem,
   pkgJson: string,
-  lockContent: string
+  lockContent: string,
+  extraFiles?: Record<string, string>
 ): Promise<RegenResult> {
   const lockPath = lockfilePath(eco, null);
   if (!lockPath) return { changed: false, note: 'kein bekanntes Lockfile' };
@@ -292,13 +391,22 @@ async function regenerateLockfile(
   const dir = mkdtempSync(path.join(os.tmpdir(), `cve-fix-${eco}-`));
   writeFileSync(path.join(dir, 'package.json'), pkgJson);
   writeFileSync(path.join(dir, lockPath), lockContent);
+  for (const [name, content] of Object.entries(extraFiles ?? {})) {
+    writeFileSync(path.join(dir, name), content);
+  }
 
   try {
     if (eco === 'npm') {
       await execFileP(
         'npm',
         ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'],
-        { cwd: dir, timeout: 5 * 60_000 }
+        {
+          cwd: dir,
+          // npm >= 12 schließt remote-tarball-Bezüge standardmäßig vom
+          // Regenerieren aus (EALLOWREMOTE); für lockfile-only Regen erlaubt.
+          env: { ...process.env, NPM_CONFIG_ALLOW_REMOTE: 'all' },
+          timeout: 5 * 60_000,
+        }
       );
     } else if (eco === 'pnpm') {
       await execFileP('corepack', ['pnpm', 'install', '--lockfile-only'], {
