@@ -2,7 +2,7 @@
 // - `affects=pkg@<concrete-version>` (keine Range-Queries → Match in eigenem Code)
 // - severity LOCALL filtern (high/critical), weil `severity=high,critical` → 422
 // - semver-Match gegen vulnerable_version_range (komma-separierte Comparators)
-// - first_patched_version.identifier als Fix-Ziel
+// - first_patched_version (String-Form ODER .identifier-Objekt) als Fix-Ziel
 // Hinweis: /advisories liefert pro Treffer das volle Objekt inklusive
 // vulnerabilities[] — kein zweiter Call je Advisory nötig.
 
@@ -25,7 +25,10 @@ interface RawAdvisory {
   vulnerabilities: Array<{
     package: { name: string; ecosystem: string };
     vulnerable_version_range: string;
-    first_patched_version: { identifier: string } | null;
+    // ACHTUNG: GET /advisories liefert hier teils String, teils {identifier}-Objekt
+    // (Doku zeigt Objekt; Live-API vom 01.11.2026 liefert plain String)
+    // → robust parsen, sonst null für ALLE Advisories.
+    first_patched_version: string | { identifier: string } | null;
   }>;
   references?: Array<{ url: string }>;
 }
@@ -79,12 +82,18 @@ export async function fetchAdvisories(
         severity: a.severity,
         summary: a.summary,
         range: v.vulnerable_version_range,
-        firstPatched: v.first_patched_version?.identifier ?? null,
+        firstPatched: patchedIdentifier(v.first_patched_version),
       });
     }
   }
   cache.set(key, out);
   return out;
+}
+
+/** first_patched_version: String-Form (live API) ODER {identifier}-Objekt (Doku/Graph). */
+export function patchedIdentifier(fp: string | { identifier: string } | null | undefined): string | null {
+  if (typeof fp === 'string') return fp.trim() ? fp.trim() : null;
+  return fp?.identifier ?? null;
 }
 
 /**
