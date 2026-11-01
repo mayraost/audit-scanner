@@ -303,6 +303,40 @@ dieses Repos:
 - **TZ**: Image setzt `TZ=Europe/Berlin` (tzdata enthalten) — Cron-Schedule
   `0 16 * * *` = 16:00 Ortszeit (15:00 bzw. 14:00 UTC je DST).
 
+## Manueller Trigger im Container (Coolify)
+
+Scan bei Bedarf anstoßen (laufende App, kein Deploy nötig). Container-Name
+ändert sich pro Deploy (Coolify-Compose, Timestamp-Suffix):
+
+```sh
+docker ps --format '{{.Names}}' | grep audit-scanner
+```
+
+**Wichtig: Wrapper + Log-Redirect benutzen, nicht `node dist/index.js scan` roh.**
+Der Wrapper (`bin/scan-wrapper.sh`) macht Log-Rotate + Heartbeat-Touch.
+Direkt im Container:
+
+```sh
+docker exec -d <container> sh -c 'sh /app/bin/scan-wrapper.sh >> /app/logs/scan.log 2>&1'
+```
+
+Redirect muss **im Container** passieren (`sh -c '… >> …'`), nicht auf dem
+Host — bei `docker exec -d` verwirft Docker den Output, ein Host-seitiges
+`>>` fängt nichts auf.
+
+Niemals **`docker exec -d … node dist/index.js scan`** ohne Redirect: der
+Lauf läuft ohne Log — Telegram-Fehler werden nur als WARN auf stdout
+geschrieben und sind unsichtbar (Lernpunkt 01.11.2026: manueller Lauf
+16:24 UTC versendete kein Telegram, WARN landete nur in verworfenem
+exec-stdout). Immer mit `>> /app/logs/scan.log 2>&1` umleiten.
+
+Status/Log nach dem Lauf:
+
+```sh
+docker exec <container> tail -50 /app/logs/scan.log
+ls -l /app/reports/$(date +%F)/      # neue report.json / report.md
+```
+
 ## Lokal ausführen (ohne Docker)
 
 Voraussetzung: Node ≥ 24, `gh` CLI authed (`gh auth status`) ODER `GH_TOKEN`
