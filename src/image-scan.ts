@@ -22,7 +22,7 @@ import { OWNER, TRIVY_BIN, TRIVY_CACHE_DIR, log } from './config.js';
 import { b64, decodeB64, ghFetch, ghJson, ghJsonOrNull } from './github.js';
 import type { RepoInfo } from './inventory.js';
 import type { FixResult } from './fix-pr.js';
-import { loadState, saveState, upsertEntry, type State } from './state.js';
+import { upsertEntry, type State } from './state.js';
 
 const execFileP = promisify(execFile);
 
@@ -531,14 +531,17 @@ function imageBranchName(date = new Date()): string {
   return `cve-audit/images-${date.toISOString().slice(0, 10)}`;
 }
 
-/** Fix-PR für gepinnte, veraltete Image-Tags (immer-PR-Policy, ohne LLM). */
-export async function createImagePr(repo: RepoInfo, bumpPlan: ImageBumpPlan[]): Promise<FixResult> {
+/**
+ * Fix-PR für gepinnte, veraltete Image-Tags (immer-PR-Policy, ohne LLM).
+ * `state` = geteiltes PR-Scann-State-Objekt (KEIN eigenes load/save — sonst
+ * überschreibt runScan-EndsaveState den Eintrag: lost update).
+ */
+export async function createImagePr(repo: RepoInfo, bumpPlan: ImageBumpPlan[], state: State): Promise<FixResult> {
   if (bumpPlan.length === 0) return { status: 'skipped', note: 'keine Image-Bump-Kandidaten' };
   // HARD GUARD: archivierte Repos bekommen nie Fix-PRs.
   if (repo.archived) return { status: 'skipped', note: 'Repo archived — kein Image-PR (hard guard)' };
 
   const branch = imageBranchName();
-  const state: State = loadState(); // Dedupe analog zu CVE-Fix-PRs (reports/state.json)
   try {
     const existing = await findOpenImagePr(repo.name, branch);
     if (existing) return { status: 'exists', prUrl: existing.url, prNumber: existing.number, branch };
@@ -612,7 +615,6 @@ export async function createImagePr(repo: RepoInfo, bumpPlan: ImageBumpPlan[]): 
       findings: [],
       kind: 'image',
     });
-    saveState(state);
     log(`${repo.name}: Image-PR #${pr.number} im State erfasst.`);
     return { status: 'created', prUrl: pr.html_url, prNumber: pr.number, branch, bumped: bumps };
   } catch (err) {

@@ -221,7 +221,7 @@ export async function runScan(opts: {
           const img = await scanRepoImages(repo, repoDir, scanTmp, trivyAvailable);
           res.images = img.findings;
           if (opts.fixPrs && img.bumpPlan.length > 0) {
-            res.imagePr = await createImagePr(repo, img.bumpPlan);
+            res.imagePr = await createImagePr(repo, img.bumpPlan, state);
           }
         } catch (ierr) {
           const imsg = ierr instanceof Error ? ierr.message : String(ierr);
