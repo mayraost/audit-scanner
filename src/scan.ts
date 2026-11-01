@@ -21,7 +21,7 @@ import {
 } from './config.js';
 import { ghBinary, ghStats } from './github.js';
 import { fetchAdvisories, GH_ECOSYSTEM, type AdvisoryHit } from './advisories.js';
-import { loadInventory, type Ecosystem, type RepoInfo } from './inventory.js';
+import { loadInventory, MANIFEST_MAP, type Ecosystem, type RepoInfo } from './inventory.js';
 import { createFixPr, type FixFinding, type FixResult } from './fix-pr.js';
 import {
   ageDays,
@@ -44,8 +44,12 @@ export interface PackageFinding {
   version: string;
   severity: 'high' | 'critical';
   advisory: AdvisoryHit | null; // null = trivy-only (kein GH-Advisory-Treffer)
-  ecosystem: string;
+  ecosystem: string; // GitHub-Advisory-Ecosystem (aus Trivy-Evidenz, rekultiviert)
   devOnly: boolean; // package.json: nur in devDependencies
+  /** Ökosystem des Evidenz-Manifests (aus Trivy-Target-Pfad). */
+  manifestEco: Ecosystem | null;
+  /** Repo-relativer Pfad des Evidenz-Manifests (z. B. docker/db-mcp/requirements.txt). */
+  manifestPath: string;
   llm?: TriageDecision; // LLM-Triage-Entscheid (wenn DEEPINFRA_API_KEY gesetzt)
 }
 
@@ -64,6 +68,7 @@ export interface RepoResult {
     | 'skipped-config'
     | 'skipped-no-manifest'
     | 'skipped-env'
+    | 'skipped-archived'
     | 'trivy-missing'
     | 'error';
   note?: string;
@@ -104,6 +109,9 @@ interface TrivyVuln {
   Severity?: string;
   FixedVersion?: string;
   PrimaryURL?: string;
+  // Durchreich-Felder aus Results[] (Target-Pfad + Ökosystem-Type der Evidenz):
+  Target?: string;
+  ScanType?: string;
 }
 
 interface TrivyResult {
@@ -114,9 +122,21 @@ interface TrivyResult {
   }>;
 }
 
-export async function runScan(opts: { sendTelegram: boolean; fixPrs: boolean }): Promise<Report> {
+export async function runScan(opts: {
+  sendTelegram: boolean;
+  fixPrs: boolean;
+  onlyRepos?: string[]; // --only=repo1,repo2 → Inventar filtern (Debug/Probe-Lauf)
+}): Promise<Report> {
+  let inventory = await loadInventory();
+  if (opts.onlyRepos && opts.onlyRepos.length > 0) {
+    const wanted = new Set(opts.onlyRepos.map((r) => r.trim()));
+    inventory = inventory.filter((r) => wanted.has(r.name));
+    log(`--only aktiv: ${inventory.length} Repos gefiltert (${opts.onlyRepos.join(', ')}).`);
+    if (inventory.length === 0) {
+      log('WARN: --only hat kein Repos ergeben.');
+    }
+  }
   const runDate = parseIsoDateKey();
-  const inventory = await loadInventory();
 
   // PR-Dedupe-State: nur aktiv, wenn Fix-PRs generell an sind (ENABLE_FIX_PRS=1).
   // Ohne Fix-PRs bleibt Verhalten wie bisher (kein state.json, kein Reminder).
@@ -158,8 +178,13 @@ export async function runScan(opts: { sendTelegram: boolean; fixPrs: boolean }):
       };
 
       if (repo.configSkip) {
-        res.status = repo.skipSource === 'SKIP_REPOS' ? 'skipped-env' : 'skipped-config';
-        res.note = `Skip via ${repo.skipSource ?? 'unbekannt'}`;
+        res.status =
+          repo.skipSource === 'SKIP_REPOS'
+            ? 'skipped-env'
+            : repo.skipSource === 'archived'
+              ? 'skipped-archived'
+              : 'skipped-config';
+        res.note = `Skip via ${repo.skipSource === 'archived' ? 'archived-Repo (hard guard)' : repo.skipSource ?? 'unbekannt'}`;
         results.push(res);
         continue;
       }
@@ -181,7 +206,7 @@ export async function runScan(opts: { sendTelegram: boolean; fixPrs: boolean }):
       try {
         const repoDir = await downloadTarball(scanTmp, repo);
         const trivyReport = await runTrivy(repo.name, repoDir, scanTmp);
-        const nums = collectFindings(trivyReport, repo.ecosystem);
+        const nums = collectFindings(trivyReport);
         results.push(
           await finalizeRepoResult(res, nums, repo, opts.fixPrs, repoDir, state)
         );
@@ -227,6 +252,36 @@ export async function runScan(opts: { sendTelegram: boolean; fixPrs: boolean }):
   return report;
 }
 
+/** Trivy-Type → Manifest-Ökosystem Fallback (wenn Target-Bname unbekannt). */
+const TRIVY_TYPE_ECO: Record<string, Ecosystem> = {
+  npm: 'npm',
+  pip: 'pip',
+  python: 'pip',
+  golang: 'go',
+  cargo: 'cargo',
+};
+
+/**
+ * Trivy-Target-Pfad (<tarball-topdir>/<rel>) → { eco, manifestPath }.
+ * Topdir-Präfix (basename des Scan-Roots) wird gestreift; Fallback: Trivy-Type.
+ */
+function manifestInfo(target: string, repoDir: string): { eco: Ecosystem; manifestPath: string } | null {
+  if (!target) return null;
+  let rel = target;
+  const top = path.basename(repoDir);
+  if (rel.startsWith(`${top}/`)) rel = rel.slice(top.length + 1);
+  const base = rel.split('/').pop() ?? rel;
+  const eco = MANIFEST_MAP[base];
+  if (eco) return { eco, manifestPath: rel };
+  // Type-Fallback (trivy liefert z. B. "package.json (pip)"-Targets):
+  // Type-Marker am Ende des Targets (Klammer-Suffix) prüfen, sonst npm-Familie annehmen.
+  const typeMarker = /\(([^)]+)\)\s*$/.exec(target)?.[1]?.toLowerCase();
+  return {
+    eco: TRIVY_TYPE_ECO[typeMarker ?? ''] ?? 'npm',
+    manifestPath: rel,
+  };
+}
+
 /** Erganzt trivy-Rohfunde (high/critical) mit /advisories als Crosscheck. */
 async function finalizeRepoResult(
   res: RepoResult,
@@ -238,16 +293,19 @@ async function finalizeRepoResult(
 ): Promise<RepoResult> {
   res.trivyIds = raw.length;
   res.status = 'scanned';
-  const ghEco = GH_ECOSYSTEM[repo.ecosystem as Ecosystem] ?? repo.ecosystem ?? 'npm';
 
-  const advisoriesByPkg = new Map<string, AdvisoryHit[]>(); // key pkg — Advisory-Cache greift
   const fixed: PackageFinding[] = [];
+  const seen = new Set<string>();
   for (const v of raw) {
-    const hits = await fetchAdvisories(ghEco, v.PkgName, v.InstalledVersion);
-    advisoriesByPkg.set(v.PkgName, hits);
+    const mi = manifestInfo(v.Target ?? '', repoDir);
+    const ghEco = mi ? GH_ECOSYSTEM[mi.eco] ?? mi.eco : 'npm';
+    const vulnKey = `${v.VulnerabilityID}|${v.PkgName}|${v.InstalledVersion}|${mi?.manifestPath ?? ''}`;
+    const hits = mi ? await fetchAdvisories(ghEco, v.PkgName, v.InstalledVersion) : [];
     if (hits.length === 0) {
       // trivy-only (z. B. NVIDIA-/OS-Feed ohne GH-Advisory) immer noch anzeigen
       if (v.Severity === 'HIGH' || v.Severity === 'CRITICAL') {
+        if (seen.has(vulnKey)) continue;
+        seen.add(vulnKey);
         fixed.push({
           pkg: v.PkgName,
           version: v.InstalledVersion,
@@ -255,39 +313,30 @@ async function finalizeRepoResult(
           devOnly: false,
           advisory: null,
           ecosystem: ghEco,
+          manifestEco: mi?.eco ?? null,
+          manifestPath: mi?.manifestPath ?? '',
         });
       }
+      continue;
+    }
+    for (const h of hits) {
+      const advKey = `${vulnKey}|${h.ghsa}|${h.range}`;
+      if (seen.has(advKey)) continue;
+      seen.add(advKey);
+      fixed.push({
+        pkg: v.PkgName,
+        version: v.InstalledVersion,
+        severity: h.severity as 'high' | 'critical',
+        devOnly: false,
+        advisory: h,
+        ecosystem: ghEco,
+        manifestEco: mi?.eco ?? null,
+        manifestPath: mi?.manifestPath ?? '',
+      });
     }
   }
 
-  // Dedupe je pkg+version: alle VULN-Referenzen pro Package sammeln
-  for (const [pkg, hits] of advisoriesByPkg) {
-    if (hits.length === 0) continue;
-    const versions = new Set(
-      raw.filter((v) => v.PkgName === pkg).map((v) => v.InstalledVersion)
-    );
-    for (const version of versions) {
-      for (const h of hits) {
-        fixed.push({
-          pkg,
-          version,
-          severity: h.severity as 'high' | 'critical',
-          devOnly: false,
-          advisory: h,
-          ecosystem: ghEco,
-        });
-      }
-    }
-  }
-
-  // ein Package-Matching nur 1× je Advisory-Rangliste: dedupe nach pkg+version+ghsaRange
-  const seen = new Set<string>();
-  res.findings = fixed.filter((f) => {
-    const key = `${f.pkg}|${f.version}|${f.advisory?.ghsa ?? 'trivy'}|${f.advisory?.range ?? ''}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  res.findings = fixed;
 
   markDevOnly(res, repoDir);
   if (res.findings.length > 0 && llmEnabled()) await applyTriage(res);
@@ -309,34 +358,40 @@ async function finalizeRepoResult(
       }
     }
 
-    // Fix-PR: pro Advisory verwertbare Fix-Version (first_patched) zusammenfassen;
-    // LLM-suppressed Findings (suppress + confidence >= 0.75) → aus PR ausgenommen
+    // Fix-PR: pro (Package + Evidenz-Manifest) verwertbare Fix-Version (first_patched)
+    // zusammenfassen; LLM-suppressed Findings (suppress + conf >= 0.75) → aus PR ausgenommen.
+    // Gruppierung über manifestPath: gleiche Paketnamen in unterschiedlichen Manifests
+    // (z. B. pip `mcp` + npm-Paket) werden getrennt behandelt.
     const findings = new Map<string, FixFinding>();
     for (const f of res.findings) {
       if (isSuppressed(f)) continue;
       if (!f.advisory?.firstPatched) continue;
-      const cur = findings.get(f.pkg);
+      if (!f.manifestEco) continue;
+      const key = `${f.pkg}|${f.manifestPath}`;
+      const cur = findings.get(key);
       if (cur) {
         if (!cur.ghsas.includes(f.advisory.ghsa)) cur.ghsas.push(f.advisory.ghsa);
         if (!cur.summary && f.advisory.summary) cur.summary = f.advisory.summary;
         // höchste Patch-Version erhöhen
-        if (f.advisory.firstPatched.localeCompare(cur.patched ?? '', undefined, { numeric: true }) > 0 && f.advisory.firstPatched) {
+        if (f.advisory.firstPatched.localeCompare(cur.patched ?? '', undefined, { numeric: true }) > 0) {
           cur.patched = f.advisory.firstPatched;
         }
       } else {
-        findings.set(f.pkg, {
+        findings.set(key, {
           pkg: f.pkg,
           version: f.version,
           patched: f.advisory.firstPatched,
           ghsas: [f.advisory.ghsa],
           severity: f.advisory.severity,
           summary: f.advisory.summary,
+          manifestEco: f.manifestEco,
+          manifestPath: f.manifestPath,
         });
       }
     }
-    if (repo.ecosystem && findings.size > 0 && (res.trivyIds ?? 0) > 0) {
+    if (findings.size > 0 && (res.trivyIds ?? 0) > 0) {
       const fixFindings = [...findings.values()];
-      res.fixPr = await createFixPr(repo, repo.ecosystem, fixFindings);
+      res.fixPr = await createFixPr(repo, fixFindings);
       recordFixPrInState(state, res.name, res.fixPr, fixFindings);
     }
   }
@@ -500,17 +555,20 @@ async function runTrivy(repo: string, target: string, scanTmp: string): Promise<
   return JSON.parse(fs.readFileSync(outPath, 'utf8')) as TrivyResult;
 }
 
-function collectFindings(report: TrivyResult, eco: Ecosystem): TrivyVuln[] {
+function collectFindings(report: TrivyResult): TrivyVuln[] {
   const out: TrivyVuln[] = [];
   for (const result of report.Results ?? []) {
     for (const v of result.Vulnerabilities ?? []) {
-      if (v.Severity === 'HIGH' || v.Severity === 'CRITICAL') out.push(v);
+      if (v.Severity === 'HIGH' || v.Severity === 'CRITICAL') {
+        // Evidenz-Kontext (Target-Pfad + Type) mit durchreichen — Basis für
+        // per-Finding-Ökosystem + Manifest-Auflösung im Fix-PR.
+        out.push({ ...v, Target: result.Target, ScanType: result.Type });
+      }
     }
   }
-  void eco;
   const seen = new Set<string>();
   return out.filter((v) => {
-    const key = `${v.VulnerabilityID}|${v.PkgName}|${v.InstalledVersion}`;
+    const key = `${v.VulnerabilityID}|${v.PkgName}|${v.InstalledVersion}|${v.Target}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -619,7 +677,9 @@ function telegramBody(report: Report, hasNewFindings: boolean): string {
     const visible = r.findings.filter((f) => !isSuppressed(f));
     lines.push(`*${r.name}* (${r.ecosystem ?? '?'}, ${visible.length} Funde):`);
     for (const f of visible) {
-      const fix = f.advisory?.firstPatched ? `→ fix: ${f.advisory.firstPatched}` : '→ keine Fix-Info';
+      const fix = f.advisory?.firstPatched
+        ? `→ fix: ${f.advisory.firstPatched}`
+        : '⚠️ keine gepatchte Version';
       const ghsa = f.advisory?.ghsa ? ` ${f.advisory.ghsa}` : '';
       const sum = f.advisory?.summary ? ` — ${trim(f.advisory.summary, 140)}` : '';
       lines.push(`  • ${f.pkg} ${f.version} [${f.severity}]${ghsa}${sum} ${fix}`);

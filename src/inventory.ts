@@ -24,9 +24,11 @@ export interface RepoInfo {
   manifestPaths: string[];
   ecosystem: Ecosystem | null;
   lockedPath: string | null;
-  /** Repo wird übersprungen (ENV-Skip-Liste oder Repo-Konfig-Datei `.cve-audit-skip`). */
+  /** Repo auf GitHub archiviert → HARD GUARD: wird immer übersprungen (kein Scan, kein Fix-PR). */
+  archived: boolean;
+  /** Repo wird übersprungen (archived / ENV-Skip-Liste / Repo-Konfig-Datei `.cve-audit-skip`). */
   configSkip: boolean;
-  skipSource: 'SKIP_REPOS' | '.cve-audit-skip' | null;
+  skipSource: 'archived' | 'SKIP_REPOS' | '.cve-audit-skip' | null;
   treeTruncated: boolean;
 }
 
@@ -34,6 +36,7 @@ interface RawRepo {
   name: string;
   fork?: boolean;
   private?: boolean;
+  archived?: boolean;
   default_branch?: string;
 }
 
@@ -51,7 +54,11 @@ export async function loadInventory(): Promise<RepoInfo[]> {
   for (const repo of owned) {
     const name = repo.name as string;
     const defaultBranch = repo.default_branch ?? 'main';
-    const envSkip = skipRepos().includes(name);
+    // ARCHIVED-GUARD (hard): archivierte Repos werden immer übersprungen —
+    // Priority über SKIP_REPOS; kein Tree-Lookup, zuverlässig von /user/repos.
+    const archived = repo.archived === true;
+    const envSkip = !archived && skipRepos().includes(name);
+    const configSkip = archived || envSkip;
     const info: RepoInfo = {
       name,
       private: repo.private ?? false,
@@ -59,12 +66,13 @@ export async function loadInventory(): Promise<RepoInfo[]> {
       manifestPaths: [],
       ecosystem: null,
       lockedPath: null,
-      configSkip: envSkip,
-      skipSource: envSkip ? 'SKIP_REPOS' : null,
+      archived,
+      configSkip,
+      skipSource: archived ? 'archived' : envSkip ? 'SKIP_REPOS' : null,
       treeTruncated: false,
     };
-    if (envSkip) {
-      out.push(info); // ENV-Skip: Tree-Lookup unnötig
+    if (configSkip) {
+      out.push(info); // archived/ENV-Skip: Tree-Lookup unnötig
       continue;
     }
     try {
@@ -76,18 +84,21 @@ export async function loadInventory(): Promise<RepoInfo[]> {
         .filter((p) => !p.includes('node_modules/'));
 
       const manifests = [...new Set(paths.filter((p) => MANIFEST_MAP[base(p)] !== undefined))];
-      const first = manifests[0];
-      const eco = first !== undefined ? MANIFEST_MAP[base(first)] ?? null : null;
       const lockedPath = pickLockedPath(manifests);
-      const configSkip = paths.includes('.cve-audit-skip');
-
+      // Ökosystem = Ökosystem der bevorzugten (Root-)Lockfile — NICHT einfach das
+      // erste Manifest im Tree: gemischte Repos wie "requirements.txt + package-lock"
+      // trugen sonst ein falsches Ökosystem für ALLE Findings/Advisory-Fetches.
+      // Fallback das erste Manifest (auch nested) — Scan-Eligibility bleibt erhalten.
+      const primary = lockedPath ?? manifests[0] ?? null;
+      const eco = primary !== null ? MANIFEST_MAP[base(primary)] ?? null : null;
+      const fileSkip = paths.includes('.cve-audit-skip');
       out.push({
         ...info,
         manifestPaths: manifests,
         ecosystem: eco,
         lockedPath,
-        configSkip,
-        skipSource: configSkip ? '.cve-audit-skip' : null,
+        configSkip: info.configSkip || fileSkip,
+        skipSource: info.skipSource ?? (fileSkip ? '.cve-audit-skip' : null),
         treeTruncated: tree.truncated === true,
       });
     } catch (err) {
