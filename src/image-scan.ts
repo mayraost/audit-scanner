@@ -312,7 +312,7 @@ function newestSameMajorTag(currentTag: string, tags: string[]): string | null {
   if (!cur.valid || cur.major === null) return null;
   const cand = tags
     .map((t) => ({ tag: t, sem: tagSemantics(t) }))
-    .filter((c) => c.sem.valid && c.sem.major === cur.major && c.sem.pinned);
+    .filter((c) => c.sem.valid && c.sem.major === cur.major && !c.sem.prerelease);
   if (cand.length === 0) return null;
 
   const sameVariant = cur.variant
@@ -323,14 +323,22 @@ function newestSameMajorTag(currentTag: string, tags: string[]): string | null {
       )
     : [];
   const pool = sameVariant.length > 0 ? sameVariant : cand;
+  // pinned-Current: nur exakte x.y.z-Kandidaten für den Bump (kein Abstieg in
+  // 2-Komp-Floats). floating-Current: 2-Komp-Tags (z. B. postgres `17.6`) auch
+  // als Info erlauben.
+  const eligible = cur.pinned ? pool.filter((c) => c.sem.pinned) : pool;
 
-  const scored = pool.sort((a, b) => {
+  const scored = eligible.sort((a, b) => {
     const va = semver.coerce(stripVariant(a.tag)) ?? '0.0.0';
     const vb = semver.coerce(stripVariant(b.tag)) ?? '0.0.0';
     return semver.compare(va, vb);
   });
   const newest = scored.at(-1);
-  return newest ? newest.tag : null;
+  if (!newest) return null;
+  // pinned never DOWN into a floating 2-comp tag:
+  if (cur.pinned ? newest.sem.pinned : true) return newest.tag;
+  // cur.pinned && kein 3-Komp-Kandidat → null (Info fehlt, kein Bump).
+  return null;
 }
 
 function strictlyNewer(currentTag: string, candidateTag: string): boolean {
