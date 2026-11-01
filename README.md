@@ -63,9 +63,44 @@ Umgebungsvariable in Coolify (bzw. lokal in eine nicht-committete `.env`).
 | `ENABLE_FIX_PRS`     | nein    | `0`           | `1`/`true` = Auto-Fix-PRs anlegen. |
 | `SKIP_REPOS`         | nein    | —             | Kommagetrennte Repo-Namen, z. B. `archive,playground`. |
 | `CRON_SCHEDULE`      | nein    | `0 16 * * *`  | Cron in Container-Zeit (TZ=Europe/Berlin → 16:00 Ortszeit). |
+| `DEEPINFRA_API_KEY`  | nein    | —             | LLM-Triage (siehe „LLM triage (optional)“). Ohne = `LLM disabled`, Scanner läuft deterministisch weiter. |
+| `LLM_MODEL`          | nein    | `zai-org/GLM-5.3-Flash` | Modell-ID am DeepInfra-Endpoint. |
+| `LLM_BASE_URL`       | nein    | `https://api.deepinfra.com/v1/openai` | OpenAI-kompatible Basis-URL. |
 
 Zusätzlich pro Repo deaktivierbar: Datei `.cve-audit-skip` im Repo-Root
 (wird im Inventar erkannt, Repo erscheint als `skip(repo-file)`).
+
+## LLM triage (optional)
+
+Mit `DEEPINFRA_API_KEY` (DeepInfra, OpenAI-kompatibler Endpoint) triagiert ein
+LLM (`zai-org/GLM-5.3-Flash` per Default) jeden high/critical-Finding:
+
+- **Entscheid** je Finding: `remediate` / `suppress` / `investigate` inkl.
+  Confidence (0–1) und Begründung (≤ 120 Zeichen).
+- **Fix-PR-Ausnahme:** Findings mit `suppress` **und** Confidence ≥ 0.75
+  landen NICHT im Fix-PR, sondern in der „LLM-suppressed“-Sektion von
+  `report.md`/`report.json` (mit reason). Alles andere läuft im normalen
+  Report/PR-Flow.
+- **Suppress-Kriterien (Prompt):** nur dev-dependency ohne Runtime-Pfad,
+  nachweislich unerreichbarer Code-Pfad, oder Fix nur als breaking-major
+  bei inaktivem Repo. Unsicherheit → `investigate`/`remediate`.
+- **Fix-PR-Body:** CVE-Absätze (Risiko 2–3 Sätze, Bump, Advisory-Link) auf
+  Englisch via LLM; ohne LLM gilt der feste Template-Body.
+- **Batching:** ≤ 20 Findings → max. 1 Call je Finding (Konkurrenz 4);
+  > 20 Findings → Bulk-Mode (alle Findings in einer Message, JSON-Array out).
+  Fehler: 1 Retry, danach deterministischer Fallback (`investigate`,
+  Confidence 0 — nichts wird suppresset).
+- **Dev-Only-Erkennung:** `devDependencies`-Mitgliedschaft wird direkt aus
+  der `package.json` des gescannten Tarballs geparst und dem Triage-Prompt
+  als Kontext mitgegeben.
+
+Ohne Key: loggt einmal `LLM disabled…`, kein sonstiges Verhalten geändert.
+
+Test (2 Fake-Findings, kein Scan/Telegram):
+
+```sh
+node dist/index.js triage-test
+```
 
 ## Coolify-Deployment
 

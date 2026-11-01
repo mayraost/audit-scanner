@@ -30,6 +30,11 @@ export const TELEGRAM_PARSE_MODE = process.env.TELEGRAM_PARSE_MODE === 'Markdown
   ? 'MarkdownV2'
   : '';
 
+// LLM-Triage (DeepInfra, OpenAI-kompatibel): Key nur ENV — niemals loggen.
+export const DEEPINFRA_API_KEY = process.env.DEEPINFRA_API_KEY?.trim() ?? '';
+export const LLM_MODEL = process.env.LLM_MODEL?.trim() || 'zai-org/GLM-5.3-Flash';
+export const LLM_BASE_URL = process.env.LLM_BASE_URL?.trim() || 'https://api.deepinfra.com/v1/openai';
+
 export function fixPrsEnabled(): boolean {
   return /^(1|true|yes)$/i.test(process.env.ENABLE_FIX_PRS ?? '');
 }

@@ -24,6 +24,7 @@ import { fetchAdvisories, GH_ECOSYSTEM, type AdvisoryHit } from './advisories.js
 import { loadInventory, type Ecosystem, type RepoInfo } from './inventory.js';
 import { createFixPr, type FixFinding, type FixResult } from './fix-pr.js';
 import { sendTelegramReport } from './telegram.js';
+import { llmEnabled, triageFindings, type TriageDecision, type TriageInput } from './llm.js';
 
 const execFileP = promisify(execFile);
 
@@ -33,6 +34,13 @@ export interface PackageFinding {
   severity: 'high' | 'critical';
   advisory: AdvisoryHit | null; // null = trivy-only (kein GH-Advisory-Treffer)
   ecosystem: string;
+  devOnly: boolean; // package.json: nur in devDependencies
+  llm?: TriageDecision; // LLM-Triage-Entscheid (wenn DEEPINFRA_API_KEY gesetzt)
+}
+
+/** Triage-konform: suppress + confidence >= 0.75 → aus Fix-PR ausgenommen. */
+export function isSuppressed(f: PackageFinding): boolean {
+  return f.llm?.decision === 'suppress' && f.llm.confidence >= 0.75;
 }
 
 export interface RepoResult {
@@ -60,6 +68,7 @@ export interface Report {
     reposTotal: number;
     scanned: number;
     findings: number;
+    suppressed: number; // LLM-suppressed (decision suppress + conf >= 0.75)
     fixPrs: number;
     apiCalls: number;
   };
@@ -134,7 +143,7 @@ export async function runScan(opts: { sendTelegram: boolean; fixPrs: boolean }):
         const repoDir = await downloadTarball(scanTmp, repo);
         const trivyReport = await runTrivy(repo.name, repoDir, scanTmp);
         const nums = collectFindings(trivyReport, repo.ecosystem);
-        results.push(await finalizeRepoResult(res, nums, repo, opts.fixPrs));
+        results.push(await finalizeRepoResult(res, nums, repo, opts.fixPrs, repoDir));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log(`WARN: Scan-Fehler für ${repo.name}: ${msg}`);
@@ -153,6 +162,7 @@ export async function runScan(opts: { sendTelegram: boolean; fixPrs: boolean }):
       reposTotal: inventory.length,
       scanned: results.filter((r) => r.status === 'scanned').length,
       findings: results.reduce((n, r) => n + r.findings.length, 0),
+      suppressed: results.reduce((n, r) => n + r.findings.filter(isSuppressed).length, 0),
       fixPrs: results.filter((r) => r.fixPr?.status === 'created').length,
       apiCalls: ghStats.apiCalls,
     },
@@ -176,7 +186,8 @@ async function finalizeRepoResult(
   res: RepoResult,
   raw: TrivyVuln[],
   repo: RepoInfo,
-  fixPrsEnabledFlag: boolean
+  fixPrsEnabledFlag: boolean,
+  repoDir: string
 ): Promise<RepoResult> {
   res.trivyIds = raw.length;
   res.status = 'scanned';
@@ -194,6 +205,7 @@ async function finalizeRepoResult(
           pkg: v.PkgName,
           version: v.InstalledVersion,
           severity: v.Severity.toLowerCase() as 'high' | 'critical',
+          devOnly: false,
           advisory: null,
           ecosystem: ghEco,
         });
@@ -213,6 +225,7 @@ async function finalizeRepoResult(
           pkg,
           version,
           severity: h.severity as 'high' | 'critical',
+          devOnly: false,
           advisory: h,
           ecosystem: ghEco,
         });
@@ -229,14 +242,20 @@ async function finalizeRepoResult(
     return true;
   });
 
+  markDevOnly(res, repoDir);
+  if (res.findings.length > 0 && llmEnabled()) await applyTriage(res);
+
   if (fixPrsEnabledFlag) {
-    // Fix-PR: pro Advisory verwertbare Fix-Version (first_patched) zusammenfassen
+    // Fix-PR: pro Advisory verwertbare Fix-Version (first_patched) zusammenfassen;
+    // LLM-suppressed Findings (suppress + confidence >= 0.75) → aus PR ausgenommen
     const findings = new Map<string, FixFinding>();
     for (const f of res.findings) {
+      if (isSuppressed(f)) continue;
       if (!f.advisory?.firstPatched) continue;
       const cur = findings.get(f.pkg);
       if (cur) {
         if (!cur.ghsas.includes(f.advisory.ghsa)) cur.ghsas.push(f.advisory.ghsa);
+        if (!cur.summary && f.advisory.summary) cur.summary = f.advisory.summary;
         // höchste Patch-Version erhöhen
         if (f.advisory.firstPatched.localeCompare(cur.patched ?? '', undefined, { numeric: true }) > 0 && f.advisory.firstPatched) {
           cur.patched = f.advisory.firstPatched;
@@ -248,6 +267,7 @@ async function finalizeRepoResult(
           patched: f.advisory.firstPatched,
           ghsas: [f.advisory.ghsa],
           severity: f.advisory.severity,
+          summary: f.advisory.summary,
         });
       }
     }
@@ -257,6 +277,48 @@ async function finalizeRepoResult(
   }
 
   return res;
+}
+
+/** devOnly je Finding aus package.json am Repo-Root bestimmen. */
+function markDevOnly(res: RepoResult, repoDir: string): void {
+  const devDeps = new Set<string>();
+  const deps = new Set<string>();
+  try {
+    const pkgJson = JSON.parse(
+      fs.readFileSync(path.join(repoDir, 'package.json'), 'utf8')
+    ) as Record<string, Record<string, unknown>>;
+    for (const k of Object.keys(pkgJson.devDependencies ?? {})) devDeps.add(k.toLowerCase());
+    for (const k of Object.keys(pkgJson.dependencies ?? {})) deps.add(k.toLowerCase());
+  } catch {
+    // kein package.json am Root (pip/go/cargo) → devOnly bleibt false
+  }
+  for (const f of res.findings) {
+    f.devOnly = devDeps.has(f.pkg.toLowerCase()) && !deps.has(f.pkg.toLowerCase());
+  }
+}
+
+/** LLM-Triage auf alle Findings eines Repos anwenden (Ergebnis an f.llm). */
+async function applyTriage(res: RepoResult): Promise<void> {
+  const pairs = res.findings.map((f) => {
+    const id = `${res.name}|${f.pkg}|${f.advisory?.ghsa ?? 'trivy'}|${f.version}`;
+    const input: TriageInput = {
+      id,
+      repo: res.name,
+      pkg: f.pkg,
+      version: f.version,
+      vulnerableRange: f.advisory?.range,
+      severity: f.severity,
+      ghsa: f.advisory?.ghsa,
+      summary: f.advisory?.summary,
+      firstPatched: f.advisory?.firstPatched,
+      devOnly: f.devOnly,
+    };
+    return { f, input };
+  });
+  const decisions = await triageFindings(pairs.map((p) => p.input));
+  for (const { f, input } of pairs) {
+    f.llm = decisions.get(input.id) ?? { decision: 'investigate', confidence: 0, reason: 'LLM unavailable — normal flow' };
+  }
 }
 
 async function downloadTarball(scanTmp: string, repo: RepoInfo): Promise<string> {
@@ -328,23 +390,36 @@ function collectFindings(report: TrivyResult, eco: Ecosystem): TrivyVuln[] {
 }
 
 function renderMarkdown(report: Report): string {
+  const summaryLine =
+    `*Repos*: ${report.summary.reposTotal} total / ${report.summary.scanned} gescannt · ` +
+    `high/critical-Advisory-Funde: ${report.summary.findings} · LLM-suppressed: ${report.summary.suppressed} · ` +
+    `Fix-PRs: ${report.summary.fixPrs} · GitHub-API-Calls: ${report.summary.apiCalls}`;
   const lines: string[] = [
     `# CVE-Audit-Report (mayraost)`,
     '',
     `*Generated*: ${report.generatedAt}`,
-    `*Repos*: ${report.summary.reposTotal} total / ${report.summary.scanned} gescannt · ` +
-      `high/critical-Advisory-Funde: ${report.summary.findings} · Fix-PRs: ${report.summary.fixPrs} · ` +
-      `GitHub-API-Calls: ${report.summary.apiCalls}`,
+    summaryLine,
     '',
   ];
   for (const r of report.repos) {
     lines.push(`## ${r.name}${r.private ? ' (private)' : ''} — ${r.status}`);
     if (r.note) lines.push(`*Hinweis*: ${r.note}`);
-    if (r.findings.length > 0) {
+    const suppressed = r.findings.filter(isSuppressed);
+    const visible = r.findings.filter((f) => !isSuppressed(f));
+    if (visible.length > 0) {
       lines.push('', '| Package | Version | Severity | GHSA | Fix |', '|---|---|---|---|---|');
-      for (const f of r.findings) {
+      for (const f of visible) {
         lines.push(
           `| ${f.pkg} | ${f.version} | ${f.severity} | ${f.advisory?.ghsa ?? '—'} | ${f.advisory?.firstPatched ?? '—'} |`
+        );
+      }
+    }
+    if (suppressed.length > 0) {
+      lines.push('', '### LLM-suppressed (nicht im Fix-PR)');
+      for (const f of suppressed) {
+        lines.push(
+          `- \`${f.pkg}@${f.version}\` ${f.advisory?.ghsa ?? '(trivy)'} — ${f.llm?.reason ?? '?'} ` +
+            `(confidence ${(f.llm?.confidence ?? 0).toFixed(2)})`
         );
       }
     }
@@ -363,14 +438,17 @@ async function sendTelegramFromReport(report: Report): Promise<void> {
 
 function telegramBody(report: Report): string {
   const lines: string[] = [];
-  const withFinds = report.repos.filter((r) => r.findings.length > 0);
+  const totalCount = report.repos.reduce((n, r) => n + r.findings.length, 0);
+  const suppressedCount = report.repos.reduce((n, r) => n + r.findings.filter(isSuppressed).length, 0);
+  const withFinds = report.repos.filter((r) => r.findings.some((f) => !isSuppressed(f)));
 
   if (withFinds.length === 0) {
     lines.push('✅ Keine high/critical-Security-Advisories gefunden.');
   }
   for (const r of withFinds) {
-    lines.push(`*${r.name}* (${r.ecosystem ?? '?'}, ${r.findings.length} Funde):`);
-    for (const f of r.findings) {
+    const visible = r.findings.filter((f) => !isSuppressed(f));
+    lines.push(`*${r.name}* (${r.ecosystem ?? '?'}, ${visible.length} Funde):`);
+    for (const f of visible) {
       const fix = f.advisory?.firstPatched ? `→ fix: ${f.advisory.firstPatched}` : '→ keine Fix-Info';
       const ghsa = f.advisory?.ghsa ? ` ${f.advisory.ghsa}` : '';
       const sum = f.advisory?.summary ? ` — ${trim(f.advisory.summary, 140)}` : '';
@@ -378,6 +456,9 @@ function telegramBody(report: Report): string {
     }
     if (r.fixPr?.prUrl) lines.push(`  🛠 Fix-PR: ${r.fixPr.prUrl}`);
     lines.push('');
+  }
+  if (suppressedCount > 0) {
+    lines.push(`🔇 LLM-suppressed: ${suppressedCount}/${totalCount} Funde (Details im Report „LLM-suppressed“-Sektion).`);
   }
   const unscannable = report.repos.filter(
     (r) => r.status.startsWith('skipped') || r.status === 'error' || r.status === 'trivy-missing'

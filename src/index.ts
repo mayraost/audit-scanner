@@ -2,6 +2,7 @@
 
 import { CRON_SCHEDULE, fixPrsEnabled, log } from './config.js';
 import { loadInventory } from './inventory.js';
+import { llmEnabled, triageFindings, type TriageInput } from './llm.js';
 import { runScan } from './scan.js';
 import { sendTelegramReport } from './telegram.js';
 
@@ -16,6 +17,7 @@ COMMANDS
                 repo-lokaler Datei .cve-audit-skip ausklammerbar.
   inventory     Nur Inventarlisting (Repos + erkannte Manifests/Ökosysteme).
   test-telegram 1 Test-Nachricht via TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID senden.
+  triage-test   LLM-Triage mit 2 Fake-Findings prüfen (kein Scan, kein Telegram).
 
 ENV
   GH_TOKEN            Pflicht (Bearer für api.github.com). Dev-Fallback lokal:
@@ -26,6 +28,9 @@ ENV
   SKIP_REPOS          Kommagetrennte Repo-Skip-Liste.
   CRON_SCHEDULE       cron-String für busybox crond (Standard: ${CRON_SCHEDULE} UTC).
   TRIVY_BIN           trivy-Pfad (Standard: trivy im PATH).
+  DEEPINFRA_API_KEY   LLM-Triage + LLM-PR-Bodies (optional; fehlt → "LLM disabled").
+  LLM_MODEL           Default: zai-org/GLM-5.3-Flash.
+  LLM_BASE_URL        Default: https://api.deepinfra.com/v1/openai.
 
 `);
   process.exit(1);
@@ -58,6 +63,43 @@ async function main(): Promise<void> {
     case 'test-telegram': {
       const ok = await sendTelegramReport('✅ audit-scanner Test-Report', body());
       process.exitCode = ok ? 0 : 2;
+      return;
+    }
+    case 'triage-test': {
+      // gibt die LLM-Entscheidung für 2 Fake-Findings aus (keine Secrets im Output)
+      if (!llmEnabled()) {
+        process.exitCode = 2; // DEEPINFRA_API_KEY fehlt
+        return;
+      }
+      const fake: TriageInput[] = [
+        {
+          id: 'fake-repo|lodash|GHSA-0000-aaaa|4.17.15',
+          repo: 'fake-repo',
+          pkg: 'lodash',
+          version: '4.17.15',
+          vulnerableRange: '<4.17.21',
+          severity: 'critical',
+          ghsa: 'GHSA-0000-aaaa',
+          summary: 'Prototype pollution in lodash',
+          firstPatched: '4.17.21',
+          devOnly: false,
+        },
+        {
+          id: 'fake-repo|some-devtool|GHSA-0000-bbbb|1.0.0',
+          repo: 'fake-repo',
+          pkg: 'some-devtool',
+          version: '1.0.0',
+          vulnerableRange: '<1.0.1',
+          severity: 'high',
+          ghsa: 'GHSA-0000-bbbb',
+          summary: 'ReDoS in a build-time formatter (devDependencies only)',
+          firstPatched: '1.0.1',
+          devOnly: true,
+        },
+      ];
+      const decisions = await triageFindings(fake);
+      process.stdout.write(JSON.stringify(Object.fromEntries(decisions), null, 2) + '\n');
+      process.exitCode = decisions.size === fake.length ? 0 : 1;
       return;
     }
     default:

@@ -14,7 +14,10 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       ENABLE_FIX_PRS: ${ENABLE_FIX_PRS:-0}
       SKIP_REPOS: ${SKIP_REPOS:-}
-# Cron in Container-Zeit (TZ=Europe/Berlin im Image): 16:00 Ortszeit.
+      DEEPINFRA_API_KEY: ${DEEPINFRA_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-zai-org/GLM-5.3-Flash}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepinfra.com/v1/openai}
+      # Cron in Container-Zeit (TZ=Europe/Berlin im Image): 16:00 Ortszeit.
       CRON_SCHEDULE: ${CRON_SCHEDULE:-0 16 * * *}
     volumes:
       - audit-reports:/app/reports   # Report-JSON/MD + .heartbeat
