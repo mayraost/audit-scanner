@@ -276,6 +276,14 @@ floating versions** — alle npm-Specifier müssen exakt sein (`x.y.z`), nie
    `node:24.22.2-alpine3.24` im Dockerfile, trivy `0.76.1`) — self-scan muss
    leer durchlaufen.
 
+## Archivierte Repos (seit v1.5.1)
+
+Archivierte Repos werden beim Inventar-Load **komplett gefiltert**: sie
+tauchen nirgends auf — kein Report-Eintrag (JSON/MD), kein Telegram-Mention,
+keine Log-/Skip-Zeile, keine `--only`-Treffer (Filter → 0 Repos, stummer
+Lauf). Andere Skips (SKIP_REPOS, `.cve-audit-skip`, kein Manifest) bleiben
+sichtbar im Report-Abschnitt „Nicht gescannt".
+
 ## Coolify-Deployment
 
 Coolify → neues Projekt/App vom Typ **Docker Compose** mit Build auf Basis

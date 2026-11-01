@@ -1,6 +1,8 @@
 // Inventar: alle Owner-Repos (public+private, forks excluded) per /user/repos
 // (paginiert) + Manifest-Discovery über Git-Trees API (Spec §2c).
 // `HEAD` als tree-ref resolved den Default-Branch (getestet).
+// v1.5.1: ARCHIVIERTE Repos werden beim Inventar-Load komplett gefiltert —
+// kein Report-Eintrag, kein Telegram-Mention, keine Log-Zeile, kein Scan.
 
 import { OWNER, log, skipRepos } from './config.js';
 import { ghJson, ghPaginate } from './github.js';
@@ -24,7 +26,9 @@ export interface RepoInfo {
   manifestPaths: string[];
   ecosystem: Ecosystem | null;
   lockedPath: string | null;
-  /** Repo auf GitHub archiviert → HARD GUARD: wird immer übersprungen (kein Scan, kein Fix-PR). */
+  /** Repo auf GitHub archiviert — wird beim Inventar-Load KOMPLETT gefiltert
+   *  (v1.5.1): taucht nirgends auf (Report/Telegram/Log/--only). Feld bleibt
+   *  aus Kompatibilitätsgründen (Fix-PR/-Image-Hard-Guards) vorhanden. */
   archived: boolean;
   /** Repo wird übersprungen (archived / ENV-Skip-Liste / Repo-Konfig-Datei `.cve-audit-skip`). */
   configSkip: boolean;
@@ -54,11 +58,13 @@ export async function loadInventory(): Promise<RepoInfo[]> {
   for (const repo of owned) {
     const name = repo.name as string;
     const defaultBranch = repo.default_branch ?? 'main';
-    // ARCHIVED-GUARD (hard): archivierte Repos werden immer übersprungen —
-    // Priority über SKIP_REPOS; kein Tree-Lookup, zuverlässig von /user/repos.
-    const archived = repo.archived === true;
-    const envSkip = !archived && skipRepos().includes(name);
-    const configSkip = archived || envSkip;
+    // ARCHIVED-GUARD (hard, v1.5.1): archivierte Repos fliegen KOMPLETT aus dem
+    // Inventar — sie tauchen nirgends auf (Report, Telegram, Log, --only).
+    if (repo.archived === true) {
+      continue;
+    }
+    const envSkip = skipRepos().includes(name);
+    const configSkip = envSkip;
     const info: RepoInfo = {
       name,
       private: repo.private ?? false,
@@ -66,13 +72,13 @@ export async function loadInventory(): Promise<RepoInfo[]> {
       manifestPaths: [],
       ecosystem: null,
       lockedPath: null,
-      archived,
+      archived: false, // archivierte Repos sind oben komplett gefiltert
       configSkip,
-      skipSource: archived ? 'archived' : envSkip ? 'SKIP_REPOS' : null,
+      skipSource: envSkip ? 'SKIP_REPOS' : null,
       treeTruncated: false,
     };
     if (configSkip) {
-      out.push(info); // archived/ENV-Skip: Tree-Lookup unnötig
+      out.push(info); // ENV-Skip: Tree-Lookup unnötig
       continue;
     }
     try {
