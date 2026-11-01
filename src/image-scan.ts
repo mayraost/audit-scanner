@@ -276,7 +276,9 @@ async function fetchRegistryTags(base: string, registry: Registry): Promise<{ ta
     const out: string[] = [];
     let u: string | null = url;
     let depth = 0;
-    while (u && depth < 2) {
+    // Hub cappt n bei 100 + lexicographic Sortierung → zuverlässiger bis-Ende-Paging
+    // (typisch ≤ ~20 Seiten): projekt-heat ok, nur je einmal je Image/Tag.
+    while (u && depth < 25) {
       const res = await fetch(u, token ? { headers: { Authorization: `Bearer ${token}` } } : {});
       if (res.status === 401 || res.status === 403) return { tags: null, note: 'nicht öffentlich (401/403) — übersprungen' };
       if (res.status === 404) return { tags: null, note: 'unbekannt (404) — übersprungen' };
@@ -284,7 +286,9 @@ async function fetchRegistryTags(base: string, registry: Registry): Promise<{ ta
       const j = (await res.json()) as { tags?: string[] | null };
       if (Array.isArray(j.tags)) out.push(...j.tags.filter((t) => typeof t === 'string' && t.length > 0));
       const link = res.headers.get('link');
-      u = link?.includes('rel="next"') ? /<([^>]+)>/.exec(link)?.[1] ?? null : null;
+      const nextPath = link?.includes('rel="next"') ? /<([^>]+)>/.exec(link)?.[1] ?? null : null;
+      // Registry liefert relative next-URLs (`/v2/...`) — absolu Badge bauen.
+      u = nextPath ? (nextPath.startsWith('http') ? nextPath : new URL(nextPath, new URL(u)).toString()) : null;
       depth++;
     }
     return { tags: [...new Set(out)] };
@@ -421,37 +425,36 @@ export async function scanRepoImages(
 
   const findings = [...byKey.values()];
   const bumpPlan: ImageBumpPlan[] = [];
-  const CONC = 3;
-  for (let i = 0; i < findings.length; i += CONC) {
-    await Promise.all(findings.slice(i, i + CONC).map(async (f) => {
-      const safe = f.image.replace(/[^A-Za-z0-9._\-/@:]/g, '_');
-      if (f.note) return; // latest/tagless/digest/invalid → kein Scan, Note bleibt stehen
-      const outPath = path.join(scanTmp, `${repo.name}.img-${i}-${safe.replace(/[/:@]/g, '_')}.trivy.json`);
-      const vulns = await trivyImageScan(f.image, outPath);
-      f.vulns.high = vulns.high;
-      f.vulns.critical = vulns.critical;
-      if (vulns.error) {
-        f.note = vulns.error;
-        return;
+  // trivy image sequential (DB-Download-LockContention vermeiden); frisch
+  // installierte Container-DB ist gecacht, typisch ≤ 5 Images je Repo.
+  for (const f of findings) {
+    const safe = f.image.replace(/[^A-Za-z0-9._\-/@:]/g, '_');
+    if (f.note) continue; // latest/tagless/digest/invalid → kein Scan, Note bleibt stehen
+    const outPath = path.join(scanTmp, `${repo.name}.img-${safe.replace(/[/:@]/g, '_')}.trivy.json`);
+    const vulns = await trivyImageScan(f.image, outPath);
+    f.vulns.high = vulns.high;
+    f.vulns.critical = vulns.critical;
+    if (vulns.error) {
+      f.note = vulns.error;
+      continue;
+    }
+    if (f.digestPinned) continue; // Freshness bewusst übersprungen (digest satt)
+    const { tags, note } = await fetchRegistryTags(f.base, f.registry);
+    if (!tags) {
+      f.note = note ?? 'keine Tag-Liste';
+      continue;
+    }
+    const newest = newestSameMajorTag(f.current, tags);
+    f.newestSameMajor = newest;
+    if (f.pinned && newest && strictlyNewer(f.current, newest)) {
+      f.updateAvailable = true;
+      for (const file of f.sourceFiles) {
+        const existing = bumpPlan.find((p) => p.file === file);
+        const bump = { from: f.image, to: `${f.base}:${newest}` };
+        if (existing) existing.bumps.push(bump);
+        else bumpPlan.push({ file, bumps: [bump] });
       }
-      if (f.digestPinned) return; // Freshness bewusst skippt (digest satt)
-      const { tags, note } = await fetchRegistryTags(f.base, f.registry);
-      if (!tags) {
-        f.note = note ?? 'keine Tag-Liste';
-        return;
-      }
-      const newest = newestSameMajorTag(f.current, tags);
-      f.newestSameMajor = newest;
-      if (f.pinned && newest && strictlyNewer(f.current, newest)) {
-        f.updateAvailable = true;
-        for (const file of f.sourceFiles) {
-          const existing = bumpPlan.find((p) => p.file === file);
-          const bump = { from: f.image, to: `${f.base}:${newest}` };
-          if (existing) existing.bumps.push(bump);
-          else bumpPlan.push({ file, bumps: [bump] });
-        }
-      }
-    }));
+    }
   }
   return { findings, bumpPlan };
 }
