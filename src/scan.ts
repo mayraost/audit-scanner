@@ -109,7 +109,8 @@ export interface Report {
     apiCalls: number;
     reminders: number; // offene Fix-PRs (Reminder-Sektion)
   };
-  reminders: ReminderInfo[];
+  reminders: ReminderInfo[]; // offene CVE-Fix-PRs (⏰-Sektion)
+  pinsReminders: ReminderInfo[]; // offene Pins-PRs (📌-Sektion, findings leer) — JEDEN Lauf erwähnen
   repos: RepoResult[];
 }
 
@@ -273,6 +274,7 @@ export async function runScan(opts: {
       reminders: collectReminders(state).length,
     },
     reminders: collectReminders(state),
+    pinsReminders: collectPinsReminders(state),
     repos: results,
   };
 
@@ -485,12 +487,37 @@ function recordFixPrInState(
   log(`${repo}: Fix-PR #${fixPr.prNumber} im State erfasst (${fixPr.status}).`);
 }
 
-/** Offene Fix-PRs aus dem reconciled State → Reminder-Infos (Alt in Tagen). */
+/** Offene CVE-Fix-PRs aus dem reconciled State → Reminder-Infos (Alt in Tagen). */
 function collectReminders(state: State, now = new Date()): ReminderInfo[] {
   const out: ReminderInfo[] = [];
   for (const [repo, entries] of Object.entries(state.prs)) {
     for (const entry of entries) {
-      if (entry.kind && entry.kind !== 'cve') continue; // Image/Pins-PRs sind keine CVE-Reminder
+      // Image-PRs: kein Reminder; Pins-PRs: eigene Reminder-Sektion (collectPinsReminders).
+      if (entry.kind && entry.kind !== 'cve') continue;
+      out.push({
+        repo,
+        prUrl: entry.prUrl,
+        prNumber: entry.prNumber,
+        ageDays: ageDays(entry, now),
+        createdAt: entry.createdAt,
+        findings: entry.findings,
+      });
+    }
+  }
+  return out.sort((a, b) => a.repo.localeCompare(b.repo) || b.createdAt.localeCompare(a.createdAt));
+}
+
+/**
+ * Offene Pins-PRs (kind 'pins') → eigene Reminder-Infos. Anders als Image-PRs
+ * JEDEN Lauf sichtbar erwähnen, solange der PR offen ist (statt nur im
+ * Erst-Erfassungs-Lauf). findings sind im Pins-Entry leer —
+ * es gibt kein floating-dep-Count-Feld im State; Zähler daher entfallen.
+ */
+function collectPinsReminders(state: State, now = new Date()): ReminderInfo[] {
+  const out: ReminderInfo[] = [];
+  for (const [repo, entries] of Object.entries(state.prs)) {
+    for (const entry of entries) {
+      if (entry.kind !== 'pins') continue;
       out.push({
         repo,
         prUrl: entry.prUrl,
@@ -740,7 +767,7 @@ async function sendTelegramFromReport(report: Report): Promise<void> {
     // Neue Pins-PRs / neue exakte Image-Pinning-Bumps zählen als "neu" (v1.5.0)
     report.repos.some((r) => r.pinsPr?.status === 'created') ||
     report.repos.some((r) => r.imagePr?.status === 'created');
-  const hasReminders = report.reminders.length > 0;
+  const hasReminders = report.reminders.length > 0 || report.pinsReminders.length > 0;
   if (!hasNew && !hasReminders) {
     // Keine neuen Funde UND keine offenen Fix-PRs → gar kein Versand (kein Spam).
     log('Telegram skip: keine neuen Findings und keine offenen Fix-PRs — kein Versand.');
@@ -751,7 +778,7 @@ async function sendTelegramFromReport(report: Report): Promise<void> {
   await sendTelegramReport(title, body);
 }
 
-/** Reminder-Sektion: offene Fix-PRs mit Alter in Tagen + offene CVEs (kompakt). */
+/** Reminder-Sektion: offene CVE-Fix-PRs + offene Pins-PRs (Alt in Tagen, kompakt). */
 function reminderLines(report: Report): string[] {
   const lines: string[] = [];
   for (const rem of report.reminders) {
@@ -762,6 +789,10 @@ function reminderLines(report: Report): string[] {
     }
     lines.push(`  🛠 PR offen: ${rem.prUrl}`);
     lines.push('');
+  }
+  // Pins-PRs NACH der CVE-Reminder-Sektion, eigener Zeilentyp (kein ⏰-Mix).
+  for (const rem of report.pinsReminders) {
+    lines.push(`📌 Pins-PR offen (floating deps): *${rem.repo}* → ${rem.prUrl} (seit ${rem.ageDays} Tagen)`);
   }
   if (lines.length > 0 && lines.at(-1) === '') lines.pop();
   return lines;
@@ -801,26 +832,22 @@ function telegramBody(report: Report, hasNewFindings: boolean): string {
   if (suppressedCount > 0) {
     lines.push(`🔇 LLM-suppressed: ${suppressedCount}/${totalCount} Funde (Details im Report „LLM-suppressed“-Sektion).`);
   }
-  // 🐳 Image-Sektion: nur Repos mit Image-Refs und zumindest vulns>0, Update
-  // oder Floating→Pin-Enforcement (v1.5.0).
+  // 🐳 Image-Sektion: nur relevante Einträge — Update verfügbar oder floating
+  // (Pin-Enforcement/„Rebuild aktualisiert"). Pinned+aktuelle Images sind raus,
+  // auch wenn sie Base-Image-Vulns haben (kein PR möglich, nur Rauschen).
+  // Repo hat offenen Image-PR → Section trotzdem zeigen (PR-Kontext).
   const imgRepos = report.repos.filter(
     (r) =>
-      r.images?.some(
-        (i) =>
-          !i.note &&
-          (i.updateAvailable || i.vulns.high + i.vulns.critical > 0 || (i.floating && i.exactPin))
-      )
+      !!r.imagePr?.prUrl ||
+      r.images?.some((i) => !i.note && (i.updateAvailable || i.floating))
   );
   if (imgRepos.length > 0) {
     lines.push('🐳 Image-Scan (Dockerfile/compose):');
     for (const r of imgRepos) {
       lines.push(`*${r.name}*:`);
       for (const f of r.images!) {
-        if (
-          f.note ||
-          (!f.updateAvailable && f.vulns.high + f.vulns.critical === 0 && !(f.floating && f.exactPin))
-        )
-          continue;
+        // skip: unscannable (note) sowie pinned+aktuell ohne Update (auch mit Vulns)
+        if (f.note || (!f.updateAvailable && !f.floating)) continue;
         const vc = `H${f.vulns.high}/C${f.vulns.critical}`;
         if (f.updateAvailable) {
           lines.push(`  • ${f.image} → ${f.newestSameMajor} ⚠️ update verfügbar [${vc}]`);
@@ -836,8 +863,10 @@ function telegramBody(report: Report, hasNewFindings: boolean): string {
       lines.push('');
     }
   }
+  // Nur echte Fehler erwähnen — skipped-Repos (z. B. kein scanbares Manifest)
+  // sind normal und erzeugen sonst nur Rauschen.
   const unscannable = report.repos.filter(
-    (r) => r.status.startsWith('skipped') || r.status === 'error' || r.status === 'trivy-missing'
+    (r) => r.status === 'error' || r.status === 'trivy-missing'
   );
   if (unscannable.length > 0) {
     lines.push('Nicht gescannt:');
@@ -851,11 +880,15 @@ function telegramBody(report: Report, hasNewFindings: boolean): string {
   }
   const imgFixed = report.repos.filter((r) => r.imagePr?.status === 'created');
   if (imgFixed.length > 0) {
-    lines.push(`🐳 Image-Pin-PRs diesmal: ${imgFixed.map((r) => r.name).join(', ')}`);
+    for (const r of imgFixed) {
+      lines.push(`🐳 Image-Pin-PR (floating image tag): *${r.name}* → ${r.imagePr!.prUrl}`);
+    }
   }
   const pinsFixed = report.repos.filter((r) => r.pinsPr?.status === 'created');
   if (pinsFixed.length > 0) {
-    lines.push(`📌 Pins-PRs diesmal: ${pinsFixed.map((r) => r.name).join(', ')}`);
+    for (const r of pinsFixed) {
+      lines.push(`📌 Pins-PR (floating deps): *${r.name}* → ${r.pinsPr!.prUrl}`);
+    }
   }
   return lines.join('\n\n');
 }
