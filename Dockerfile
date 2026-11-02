@@ -30,8 +30,12 @@ COPY bin ./bin
 # reports/logs/cache/crontabs müssen node gehören (Volumes mounten auf dieselben Pfade)
 RUN mkdir -p /app/reports /app/logs /app/.cache/trivy /app/crontabs /app/tmp \
   && chown -R node:node /app
-USER node
-# HEALTHCHECK ohne HTTP: Heartbeat-Alter (Spec-Angabe, 48h Toleranz für Cron-Skip)
+# KEIN `USER node`: busybox crond MUSS als root laufen — es lädt Crontab-Files nur
+# bei st_uid==0 (crond.c:440, DAEMON_UID) und demoted Jobs selbst via setuid auf
+# den File-Owner (→ Jobs laufen als node, ENV mit Secrets wird vererbt). Als
+# non-root: Files werden still ignoriert UND Jobs sterben an setgroups(EPERM).
+# Bug-Quelle vor 02.11.2026: unter `USER node` feuerte der 16:00-Cron nie.
+# Container-Root ist hier ausdrücklich nur für crond; Scanner-Job läuft als node.
 HEALTHCHECK --interval=15m --timeout=10s --start-period=2m --retries=3 \
   CMD test $(( $(date +%s) - $(stat -c %Y /app/reports/.heartbeat 2>/dev/null || echo 0) )) -lt 172800
 ENTRYPOINT ["/bin/sh", "/app/bin/entrypoint.sh"]
