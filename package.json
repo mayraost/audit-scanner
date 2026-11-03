@@ -15,7 +15,7 @@
     "state-test": "node dist/index.js state-test"
   },
   "dependencies": {
-    "semver": "7.8.5"
+    "semver": "7.8.6"
   },
   "devDependencies": {
     "@types/node": "26.6.6",
