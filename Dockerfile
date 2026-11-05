@@ -20,7 +20,7 @@ FROM node:26.13.0-alpine3.24 AS runner
 ENV NODE_ENV=production
 ENV TZ=Europe/Berlin
 ENV TRIVY_CACHE_DIR=/app/.cache/trivy
-COPY --from=aquasec/trivy:0.76.1 /usr/local/bin/trivy /usr/local/bin/trivy
+COPY --from=aquasec/trivy:0.76.2 /usr/local/bin/trivy /usr/local/bin/trivy
 # TZ=Europe/Berlin: Busybox-crond löst Zeitzonen via zoneinfo auf → tzdata nötig
 RUN apk add --no-cache tzdata
 WORKDIR /app
