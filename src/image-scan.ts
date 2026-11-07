@@ -27,6 +27,8 @@ import { OWNER, TRIVY_BIN, TRIVY_CACHE_DIR, log } from './config.js';
 import { b64, decodeB64, ghFetch, ghJson, ghJsonOrNull } from './github.js';
 import type { RepoInfo } from './inventory.js';
 import type { FixResult } from './fix-pr.js';
+import { imagePublishedAt } from './publish-dates.js';
+import { updateEligibility, type Eligibility } from './soaking.js';
 import { upsertEntry, type State } from './state.js';
 
 const execFileP = promisify(execFile);
@@ -55,8 +57,23 @@ export interface ImageFinding {
   exactPin: string | null;
   /** pinned && strictly-newer same-major bei der Registry verfügbar. */
   updateAvailable: boolean;
+  /**
+   * Variant-Drift (v1.6.0): semver-identischer, aber variant-differenter neuerer
+   * Registry-Tag (z. B. aktuell `0.8.7-pg17`, neu `0.8.7-pg17-trixie` = anderer
+   * OS-Basis-Token). REIN REPORT-ONLY: kein Bump-Plan, kein PR — Variant-/OS-
+   * Wechsel ist ein Risiko, keine Update-Empfehlung. null = kein Drift.
+   */
+  variantDrift?: string | null;
   /** Skip-/Hinweis-Grund (private, latest, Variable, 404 …). */
   note?: string;
+  /** v1.6.0: Publish-Datum des Kandidaten (Soaking), null = unbekannt. */
+  newestPublishedAt?: string | null;
+  /** v1.6.0: Soaking-Entscheidung für den Kandidaten. */
+  eligibility?: Eligibility;
+  /** v1.6.0: Klartext-Status (z. B. "zu jung (2d)"). */
+  eligibilityLabel?: string;
+  /** v1.6.0: Alter des Kandidaten in Tagen. */
+  ageDays?: number | null;
 }
 
 /** Bump-Plan (je File): literal `${base}:${oldTag}` → `${base}:${newTag}`. */
@@ -226,7 +243,10 @@ interface TagSemantics {
   valid: boolean; // nutzbar für Freshness
 }
 
-function tagSemantics(tag: string): TagSemantics {
+/**
+ * Tag-Semantik (exportiert für `image-freshness-test`, siehe src/index.ts).
+ */
+export function tagSemantics(tag: string): TagSemantics {
   const m = /^v?(\d+(?:\.\d+)*)([-+].*)?$/.exec(tag);
   const base: TagSemantics = {
     major: null,
@@ -253,6 +273,78 @@ function tagSemantics(tag: string): TagSemantics {
     prerelease,
     valid: true,
   };
+}
+
+/**
+ * Bekannte OS-/Distro-Release-Token in Docker-Tags (v1.6.0). Extrafügen der
+ * Kandidaten-Varianten um höchstens EINEN Token aus dieser Liste gelten als
+ * "gleiche Variante, andere OS-Basis" (z. B. `alpine` → `alpine3.24`,
+ * `slim` → `slim-trixie`) — NICHT als Versions-Update. Alles andere, was die
+ * Tokens nicht als Präfix enthält, ist eine fremde Variante.
+ * Erweitern nur mit belegten Tag-Repos (Bookworm/Bullseye/Buster/Noble/Jammy
+ * sind die gängigen Debian/Ubuntu-Slugs bei library-Images).
+ */
+const OS_RELEASE_TOKENS: ReadonlySet<string> = new Set([
+  'trixie',
+  'bookworm',
+  'bullseye',
+  'buster',
+  'stretch',
+  'noble',
+  'jammy',
+  'focal',
+  'slim',
+  'nanoserver',
+  'scratch',
+]);
+/** Token-zerlegte Variante (`slim-trixie` → ['slim','trixie'], '' → []). */
+function variantTokens(variant: string): string[] {
+  return variant ? variant.split('-').filter((t) => t.length > 0) : [];
+}
+
+/** OS-Release-Token-Form: bekannter Slug oder `alpine3.24` / `alpine3`. */
+function isOsReleaseToken(tok: string): boolean {
+  const l = tok.toLowerCase();
+  if (OS_RELEASE_TOKENS.has(l)) return true;
+  return /^alpine\d(\.\d+)?$/.test(l);
+}
+
+/**
+ * Variant-Kompatibilität (v1.6.0, token-basiert): true, wenn die Tokens des
+ * current-Tags Präfix der Kandidaten-Tokens sind und der Kandidat HÖCHSTENS
+ * einen zusätzlichen Token hat, der ein bekanntes OS-Release ist.
+ * Damit: `alpine` → `alpine3.24` ✓, `slim` → `slim-trixie` ✓,
+ * `pg17` → `pg17-trixie` ✓ (OS-Basis-Wechsel, KEIN Versions-Bump → siehe
+ * strictlyNewer), `pg17` → `pg17-trixie-foo` ✗, `pg17` → `bookworm` ✗.
+ * Bewusste Restriktion: lieber kein "update verfügbar" als ein falscher Bump
+ * (Variant-Wechsel = OS-Basis-/Risiko-Wechsel).
+ */
+function variantCompatible(curVariant: string, candVariant: string): boolean {
+  const cur = variantTokens(curVariant);
+  const cand = variantTokens(candVariant);
+  if (cur.length > cand.length) return false;
+  for (let i = 0; i < cur.length; i++) {
+    if (cur[i]!.toLowerCase() !== cand[i]!.toLowerCase()) return false;
+  }
+  const extra = cand.slice(cur.length);
+  if (extra.length === 0) return true; // exakt gleiche Tokens
+  return extra.length === 1 && isOsReleaseToken(extra[0]!);
+}
+
+/** Variante ohne OS-Release-Token (`pg17-trixie` → `pg17`, `alpine3.24` → ``). */
+function variantWithoutOsTokens(variant: string): string {
+  return variantTokens(variant).filter((t) => !isOsReleaseToken(t)).join('-');
+}
+
+/**
+ * Variante OHNE die OS-Basis (`slim-trixie` → `slim`, `pg17` → `pg17`,
+ * `alpine3.24` → ``). Für OS-Basis-Vergleiche: gleiche Nicht-OS-Tokens ==
+ * gleiche Linux-Distri-Familie, nur anderer Release-Slug.
+ */
+function variantDistro(variant: string): string {
+  return variantTokens(variant)
+    .filter((t) => !isOsReleaseToken(t))
+    .join('-');
 }
 
 async function registryToken(base: string, registry: Registry): Promise<string | null> {
@@ -308,47 +400,110 @@ function stripVariant(tag: string): string {
   return tag.replace(/([-+].*)$/, '');
 }
 
-/**
- * Neuester gepinnter Tag im selben Major; Variant-Suffix wird bevorzugt exakt
- * gematcht, sonst Prefix-Fallback (`alpine` → `alpine3.22`). Pre-Releases aus,
- * vergleiche semver (strippte Variante). Rückgabe auch floating-Fällen als
- * Info; nur für pinned-Refs wirfold ein PR gebaut.
- */
-function newestSameMajorTag(currentTag: string, tags: string[]): string | null {
-  const cur = tagSemantics(currentTag);
-  if (!cur.valid || cur.major === null) return null;
-  const cand = tags
-    .map((t) => ({ tag: t, sem: tagSemantics(t) }))
-    .filter((c) => c.sem.valid && c.sem.major === cur.major && !c.sem.prerelease);
-  if (cand.length === 0) return null;
-
-  const sameVariant = cur.variant
-    ? cand.filter(
-        (c) =>
-          c.sem.variant === cur.variant ||
-          c.sem.variant.startsWith(`${cur.variant}`) // alpine + alpine3.22
-      )
-    : [];
-  const pool = sameVariant.length > 0 ? sameVariant : cand;
-  // pinned-Current: nur exakte x.y.z-Kandidaten für den Bump (kein Abstieg in
-  // 2-Komp-Floats). floating-Current: 2-Komp-Tags (z. B. postgres `17.6`) auch
-  // als Info erlauben.
-  const eligible = cur.pinned ? pool.filter((c) => c.sem.pinned) : pool;
-
-  const scored = eligible.sort((a, b) => {
-    const va = semver.coerce(stripVariant(a.tag)) ?? '0.0.0';
-    const vb = semver.coerce(stripVariant(b.tag)) ?? '0.0.0';
-    return semver.compare(va, vb);
-  });
-  const newest = scored.at(-1);
-  if (!newest) return null;
-  // pinned never DOWN into a floating 2-comp tag:
-  if (cur.pinned ? newest.sem.pinned : true) return newest.tag;
-  // cur.pinned && kein 3-Komp-Kandidat → null (Info fehlt, kein Bump).
-  return null;
+/** Registry-sortierbarer Semver-Wert eines Tags (Variant gestrippt). */
+function coerceTag(tag: string): semver.SemVer {
+  return semver.coerce(stripVariant(tag)) ?? new semver.SemVer('0.0.0');
 }
 
-function strictlyNewer(currentTag: string, candidateTag: string): boolean {
+/**
+ * CVE-Ausnahme für Image-Bumps (v1.6.0, bewusst STRENG).
+ *
+ * Ein Base-Image-Bump (node:26.13 → 26.14) beweist KEINEN CVE-Fix — er kann
+ * einen mitbringen, muss aber nicht (Review §6.3, Owner-Entscheidung "streng").
+ * Einzige Ausnahme: Security-Werkzeuge, deren Releases per Definition
+ * Vulnerability-/Signatur-Daten ausliefern — dort ist JEDES Update ein
+ * Security-Release, die 3-Tage-Regen kontraproduktiv.
+ *
+ * Der belegbare Einzelfall-Fix (advisory.firstPatched == Zielversion) wird im
+ * Paket-Scan ausgewertet, nicht hier.
+ */
+export function isSecurityToolBump(base: string): boolean {
+  return /^aquasec\/trivy$/i.test(base) || /^anchore\/(grype|syft)$/i.test(base);
+}
+
+/**
+ * Neuester gepinnter Tag im selben Major; Variant-Suffix wird token-basiert
+ * gematcht (v1.6.0, siehe variantCompatible: `alpine` → `alpine3.24` ja,
+ * `pg17` → `pg17-trixie` nur als OS-Basis-Drift, nie als Versions-Bump).
+ * Pre-Releases aus, verglichen wird semver (strippte Variante).
+ *
+ * Invarianten (alle als Filter, damit `scored.at(-1)` nie blind gewinnt):
+ * - Kandidat ist NIE semver-kleiner als currentTag (sonst kein Downgrade-Bump).
+ * - pinned-current: nur 3-Komp-Kandidaten ("pinned never DOWN into floating").
+ * - Variante: exakt gleiche Tokens zuerst; erst wenn kein semver-neuerer
+ *   gleicher-Varianten-Tag existiert, dürfen OS-Basis-Varianten (genau ein
+ *   zusätzlicher OS-Release-Token) als "newest"-Info dienen.
+ */
+export function newestSameMajorTag(currentTag: string, tags: string[]): string | null {
+  const cur = tagSemantics(currentTag);
+  if (!cur.valid || cur.major === null) return null;
+  const curVer = coerceTag(currentTag);
+  const cand = tags
+    .map((t) => ({ tag: t, sem: tagSemantics(t), ver: coerceTag(t) }))
+    .filter(
+      (c) =>
+        c.sem.valid && c.sem.major === cur.major && !c.sem.prerelease && !semver.lt(c.ver, curVer) &&
+        (cur.pinned ? c.sem.pinned : true)
+    );
+  if (cand.length === 0) return null;
+
+  const newestOf = (pool: typeof cand): string | null =>
+    [...pool].sort((a, b) => semver.compare(a.ver, b.ver)).at(-1)?.tag ?? null;
+
+  // 1) exakt gleiche Variant-Tokens (± Groß-/Kleinschreibung)
+  const sameVariant = newestOf(cand.filter((c) => c.sem.variant === cur.variant));
+  if (sameVariant !== null && (!cur.variant || strictlyNewer(currentTag, sameVariant))) return sameVariant;
+  // 2) sonst OS-Basis-Kandidaten (gleiche Nicht-OS-Tokens, genau 1 Zusatz-Token):
+  //    nur INFO ("andere Basis verfügbar") — strictlyNewer ist dort i. d. R. false.
+  if (cur.variant) {
+    const osDrift = cand.filter(
+      (c) =>
+        c.sem.variant !== cur.variant &&
+        variantCompatible(cur.variant, c.sem.variant) &&
+        variantWithoutOsTokens(c.sem.variant) === variantWithoutOsTokens(cur.variant)
+    );
+    const drift = newestOf(osDrift);
+    if (drift !== null) return drift;
+  }
+  return sameVariant;
+}
+
+/**
+ * Variant-Drift (v1.6.0): neuester Registry-Tag im selben Major, der semver-
+ * GLEICH dem current-Tag ist, aber eine andere Variante (andere OS-Basis,
+ * z. B. `pg17` → `pg17-trixie`, `slim` → `slim-trixie`) hat. Report-only —
+ * kein Bump, kein PR. null, wenn kein solcher Tag existiert.
+ */
+export function variantDriftTag(currentTag: string, tags: string[]): string | null {
+  const cur = tagSemantics(currentTag);
+  if (!cur.valid || cur.prerelease || cur.major === null) return null;
+  const curVer = coerceTag(currentTag);
+  const drift = tags
+    .map((t) => ({ tag: t, sem: tagSemantics(t), ver: coerceTag(t) }))
+    .filter(
+      (c) =>
+        c.sem.valid && !c.sem.prerelease && c.sem.major === cur.major &&
+        c.tag !== currentTag && c.sem.variant !== cur.variant &&
+        c.sem.comps === cur.comps && semver.eq(c.ver, curVer)
+    )
+    .sort((a, b) => {
+      // Stabil & relevant: gleiche Linux-Distri-Familie zuerst
+      // (pg17 → pg17-trixie, slim → slim-trixie), dann alphabetisch.
+      const da = Number(variantDistro(a.sem.variant) === variantDistro(cur.variant));
+      const db = Number(variantDistro(b.sem.variant) === variantDistro(cur.variant));
+      return db - da || a.tag.localeCompare(b.tag);
+    });
+  return drift[0]?.tag ?? null;
+}
+
+/**
+ * Streng neuer (v1.6.0, Invariante dokumentiert): verglichen wird NUR der
+ * Zahlen-Teil (Variant gestrippt). Ergebnis ist damit zwangsläufig `false`
+ * bei semver-Gleichheit, auch wenn sich die Varianten unterscheiden — ein
+ * Variant-/OS-Wechsel (`pg17` → `pg17-trixie`, `slim` → `slim-trixie`) ist
+ * KEIN Update-Kandidat (eigene Kategorie `variantDrift`, report-only).
+ */
+export function strictlyNewer(currentTag: string, candidateTag: string): boolean {
   const a = semver.coerce(stripVariant(currentTag));
   const b = semver.coerce(stripVariant(candidateTag));
   if (!a || !b) return false;
@@ -357,30 +512,23 @@ function strictlyNewer(currentTag: string, candidateTag: string): boolean {
 
 /**
  * Floating→Pin-Bump-Ziel: neuester EXAKTER (3-Komp, non-prerelease) Tag im
- * selben Major. Variant des current-Tags wird bevorzugt exakt/gematched
- * (`alpine` → alpine3.x), sonst Prefix-Fallback auf alle 3-Komp-Tags — oder
- * variant-frei, wenn current variant-los war. null, wenn kein Pinned-Kandidat.
+ * selben Major. Variant des current-Tags wird token-basiert gematcht
+ * (`alpine` → alpine3.x, `slim` → `slim-trixie`), sonst Fallback auf alle
+ * 3-Komp-Tags — oder variant-frei, wenn current variant-los war. null, wenn
+ * kein Pinned-Kandidat.
  */
-function newestExactTag(currentTag: string, tags: string[]): string | null {
+export function newestExactTag(currentTag: string, tags: string[]): string | null {
   const cur = tagSemantics(currentTag);
   if (!cur.valid || cur.major === null || cur.prerelease) return null;
   const cand = tags
-    .map((t) => ({ tag: t, sem: tagSemantics(t) }))
-    .filter((c) => c.sem.valid && c.sem.pinned && c.sem.major === cur.major);
+    .map((t) => ({ tag: t, sem: tagSemantics(t), ver: coerceTag(t) }))
+    .filter((c) => c.sem.valid && c.sem.pinned && !c.sem.prerelease && c.sem.major === cur.major);
   if (cand.length === 0) return null;
   const sameVariant = cur.variant
-    ? cand.filter(
-        (c) =>
-          c.sem.variant === cur.variant ||
-          c.sem.variant.startsWith(`${cur.variant}`) // alpine + alpine3.22
-      )
+    ? cand.filter((c) => variantCompatible(cur.variant, c.sem.variant))
     : cand.filter((c) => c.sem.variant === '');
   const pool = sameVariant.length > 0 ? sameVariant : cand;
-  const scored = pool.sort((a, b) => {
-    const va = semver.coerce(stripVariant(a.tag)) ?? '0.0.0';
-    const vb = semver.coerce(stripVariant(b.tag)) ?? '0.0.0';
-    return semver.compare(va, vb);
-  });
+  const scored = [...pool].sort((a, b) => semver.compare(a.ver, b.ver));
   return scored.at(-1)?.tag ?? null;
 }
 
@@ -492,8 +640,25 @@ export async function scanRepoImages(
     const exact = newestExactTag(f.current, tags);
     f.newestSameMajor = newest ?? exact;
     f.exactPin = exact;
+    // Variant-Drift (v1.6.0): semver-gleicher Tag mit anderer OS-/Variant-Basis
+    // (z. B. pg17 → pg17-trixie) → report-only Marker, KEIN Bump, KEIN PR.
+    f.variantDrift = variantDriftTag(f.current, tags);
     if (f.pinned && newest && strictlyNewer(f.current, newest)) {
       f.updateAvailable = true;
+      // Soaking (v1.6.0): PR nur, wenn der Ziel-Tag die Mindest-Reife hat.
+      // Ohne belegbaren CVE-Fix gilt der Streit-Wert UPDATE_MIN_AGE_DAYS.
+      const cveFix = isSecurityToolBump(f.base);
+      const age = await imagePublishedAt(f.base, newest, f.registry);
+      const el = updateEligibility({
+        variantChange: false,
+        publishedAt: age.publishedAt,
+        cveFix,
+      });
+      f.newestPublishedAt = age.publishedAt;
+      f.eligibility = el.eligibility;
+      f.eligibilityLabel = el.label;
+      f.ageDays = el.ageDays;
+      if (el.eligibility === 'too-young') continue; // Info ja, PR nein
       for (const file of f.sourceFiles) {
         const existing = bumpPlan.find((p) => p.file === file);
         const bump = { from: f.image, to: `${f.base}:${newest}` };
@@ -507,6 +672,19 @@ export async function scanRepoImages(
       // wennś frisch ist (exact-Pin-Pflicht). updateAvailable = zusätzlich
       // neuer als die Auflösung hinter dem floating Tag.
       if (strictlyNewer(f.current, exact)) f.updateAvailable = true;
+      // Soaking gilt auch für den Pin-Bump, aber ohne CVE-Bezug (nur Info-Zeile
+      // bei zu jung): ein Floating-Tag ist kein Fix, sondern Hygiene.
+      const age = await imagePublishedAt(f.base, exact, f.registry);
+      const el = updateEligibility({
+        variantChange: false,
+        publishedAt: age.publishedAt,
+        cveFix: false,
+      });
+      f.newestPublishedAt = age.publishedAt;
+      f.eligibility = el.eligibility;
+      f.eligibilityLabel = el.label;
+      f.ageDays = el.ageDays;
+      if (el.eligibility === 'too-young') continue;
       for (const file of f.sourceFiles) {
         const existing = bumpPlan.find((p) => p.file === file);
         const bump = { from: f.image, to: `${f.base}:${exact}` };
@@ -573,6 +751,7 @@ function mkFinding(
     newestSameMajor: null,
     exactPin: null,
     updateAvailable: false,
+    variantDrift: null,
     note,
   };
 }
@@ -694,12 +873,17 @@ async function tryCreateRef(repo: string, branch: string, sha: string): Promise<
   throw new Error(`ref-create ${res.status}: ${body.slice(0, 200)}`);
 }
 
-/** Literal-Swap `from` → `to` mit Tag-Grenze (kein Anhängsel aus Zahlen/Punkten). */
+/**
+ * Literal-Swap `from` → `to` mit Ref-Grenzen auf BEIDEN Seiten (v1.5.3, P1-Fix).
+ * - links: kein Zeichen, das Teil eines Ref-Tokens sein könnte (sonst matcht
+ *   `node:24` mitten in `my-node:24` oder `node:240`).
+ * - rechts: kein Anhängsel aus Zahlen/Punkten UND kein `-`/`+`-Suffix — sonst
+ *   wird `node:24` in `node:24-alpine` zu `node:24.12.0-alpine-alpine`.
+ * Erlaubt bleiben: `@<digest>`, Whitespace, `AS`/` as `, Zeilenende, `/` (Pfad).
+ */
 export function replaceTag(content: string, from: string, to: string): string {
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // boolean boundary: Ende der Tag-Route — danach kann @digest, AS/, Whitespace oder
-  // Zeilenende folgen; NICHT: weitere Versionssprecher (Zahl/Punkt/-buchstabe?).
-  const re = new RegExp(`${esc(from)}(?![0-9.])`, 'g');
+  const re = new RegExp(`(?<![A-Za-z0-9._/-])${esc(from)}(?![A-Za-z0-9._-])`, 'g');
   return content.replace(re, to);
 }
 

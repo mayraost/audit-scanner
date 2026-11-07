@@ -31,6 +31,12 @@ export interface PrEntry {
 
 export interface State {
   prs: Record<string, PrEntry[]>;
+  /**
+   * Image-Vuln-Novelty-Register (v1.5.2): je Repo `image -> "H<high>/C<critical>"`
+   * (zuletzt GEMELDETE Zahlen). Nur für Telegram-Dedupe der Base-Image-CVEs;
+   * alte state.json ohne Feld → undefined (= erster Lauf für dieses Register).
+   */
+  imageVulns?: Record<string, Record<string, string>>;
 }
 
 const EMPTY_STATE: State = { prs: {} };
@@ -70,7 +76,50 @@ export function parseState(raw: string): State | null {
     const valid = entries.filter(isPrEntry);
     if (valid.length > 0) state.prs[repo] = valid;
   }
+  // imageVulns ist OPTIONAL (Abwärtskompatibilität: alte state.json hat das Feld
+  // nicht). Kaputte Strukturen werden verworfen, nicht zum Parse-Fehler gemacht.
+  const rawImageVulns = (json as { imageVulns?: unknown }).imageVulns;
+  if (typeof rawImageVulns === 'object' && rawImageVulns !== null) {
+    const registry: Record<string, Record<string, string>> = {};
+    for (const [repo, map] of Object.entries(rawImageVulns as Record<string, unknown>)) {
+      if (typeof map !== 'object' || map === null) continue;
+      const images: Record<string, string> = {};
+      for (const [image, sig] of Object.entries(map as Record<string, unknown>)) {
+        if (typeof sig === 'string') images[image] = sig;
+      }
+      if (Object.keys(images).length > 0) registry[repo] = images;
+    }
+    if (Object.keys(registry).length > 0) state.imageVulns = registry;
+  }
   return state;
+}
+
+/** Signatur (H/C) eines State-Eintrags im imageVulns-Register. */
+export function imageVulnSignature(high: number, critical: number): string {
+  return `H${high}/C${critical}`;
+}
+
+/** Zuletzt gemeldete Signatur für Repo+Image (null = dem Scanner noch unbekannt). */
+export function knownImageVulns(state: State, repo: string, image: string): string | null {
+  return state.imageVulns?.[repo]?.[image] ?? null;
+}
+
+/** Novelty-Regel: Signatur weicht ab ODER Image fehlt im Register. */
+export function isNovelImageVuln(state: State, repo: string, image: string, high: number, critical: number): boolean {
+  const known = knownImageVulns(state, repo, image);
+  return known === null || known !== imageVulnSignature(high, critical);
+}
+
+/** Gemeldete Image-Signatur merken (erst NACH erfolgreichem Telegram-Versand aufrufen). */
+export function markImageVulnsReported(
+  state: State,
+  repo: string,
+  entries: Array<{ image: string; high: number; critical: number }>
+): void {
+  if (entries.length === 0) return;
+  const repoMap = (state.imageVulns ??= {})[repo] ?? {};
+  state.imageVulns![repo] = repoMap;
+  for (const e of entries) repoMap[e.image] = imageVulnSignature(e.high, e.critical);
 }
 
 /** state.json laden — fehlend/corrupt = leerer State (nur Log, nie Throw). */

@@ -21,7 +21,11 @@ import { OWNER, log } from './config.js';
 import { decodeB64, ghFetch, ghJson, ghJsonOrNull } from './github.js';
 import type { RepoInfo } from './inventory.js';
 import { regenerateLockfile, putContent, type FixResult } from './fix-pr.js';
+import { channelCompatible, classifyPrerelease, showExoticPrereleases } from './prerelease.js';
+import { npmVersionPublishedAt } from './publish-dates.js';
+import { updateEligibility, type Eligibility } from './soaking.js';
 import { upsertEntry, type State } from './state.js';
+
 
 export type PinSection =
   | 'dependencies'
@@ -39,6 +43,19 @@ export interface PinFinding {
   manifestPath: string;
   /** warn = production dep; info = dev/optional/peer (kein CVE). */
   severity: 'info' | 'warn';
+  /** v1.6.0: Publish-Datum der Ziel-Version (Soaking). */
+  latestPublishedAt?: string | null;
+  /** v1.6.0: Soaking-Entscheidung für das Pin-Ziel. */
+  eligibility?: Eligibility;
+  eligibilityLabel?: string;
+  ageDays?: number | null;
+  /** v1.6.0: neuerer Beta/RC-Kandidat (Kanal-kompatibel) — NUR Info, nie PR. */
+  prereleaseHint?: string | null;
+  /** v1.6.0: Publish-Datum des Beta-Kandidaten. */
+  prereleasePublishedAt?: string | null;
+  /** v1.6.0: Soaking-Entscheidung für den Beta-Kandidaten. */
+  prereleaseEligibility?: Eligibility;
+  prereleaseLabel?: string;
 }
 
 export interface PinScanResult {
@@ -70,6 +87,20 @@ export function isFloatingSpec(spec: unknown): spec is string {
   return semver.valid(s) === null;
 }
 
+/**
+ * Exakt gepinnter PRE-RELEASE (v1.6.0, N2): `"7.1.0-beta"` ist `semver.valid`
+ * → per Definition nicht "floating", aber wir wollen trotzdem wissen, ob im
+ * selben Kanal ein neueres Beta existiert (Owner: "Beta updates nur anzeigen,
+ * wenn package bereits als beta hinterlegt ist"). Kein Pins-PR, keine Zensur.
+ */
+export function isPinnedPrereleaseSpec(spec: unknown): spec is string {
+  const s = typeof spec === 'string' ? spec.trim() : '';
+  if (!s || s.includes(' ')) return false;
+  const v = semver.valid(s);
+  if (!v) return false;
+  return semver.prerelease(v) !== null;
+}
+
 /** Sammle package.json-Dateien (repoDir-Checkout nach Tarball-Entpacken). */
 function findPackageJsonFiles(root: string): string[] {
   const out: string[] = [];
@@ -90,25 +121,62 @@ function findPackageJsonFiles(root: string): string[] {
 
 // ————————————————— npm-Registry latest-Lookup (cache pro pkg) —————————————————
 
-const latestCache = new Map<string, string | null>();
+interface NpmPackument {
+  'dist-tags'?: Record<string, string>;
+  time?: Record<string, string>;
+}
 
-/** dist-tags.latest via registry.npmjs.org (GET /<pkg>). Fehler → null. */
-async function npmLatest(pkg: string): Promise<string | null> {
-  if (latestCache.has(pkg)) return latestCache.get(pkg)!;
-  let out: string | null = null;
+const packumentCache = new Map<string, NpmPackument | null>();
+
+/** Packument (dist-tags + time[]) via registry.npmjs.org. Fehler → null. */
+async function npmPackument(pkg: string): Promise<NpmPackument | null> {
+  if (packumentCache.has(pkg)) return packumentCache.get(pkg)!;
+  let out: NpmPackument | null = null;
   try {
     // Pkg-Namen sind restriktives Charset ([a-z0-9@/._-]) → direkt in URL ok;
     // scoped '@scope/name' mit unverschlüsseltem Slash (npm-Registry-Konvention).
     const res = await fetch(`https://registry.npmjs.org/${pkg}`, { signal: AbortSignal.timeout(10_000) });
-    if (res.ok) {
-      const j = (await res.json()) as { 'dist-tags'?: { latest?: string } };
-      out = j['dist-tags']?.latest ?? null;
-    }
+    if (res.ok) out = (await res.json()) as NpmPackument;
   } catch (err) {
     log(`npm-Latest-Lookup fehlgeschlagen für ${pkg}: ${err instanceof Error ? err.message : '?'}`);
   }
-  latestCache.set(pkg, out);
+  packumentCache.set(pkg, out);
   return out;
+}
+
+/** dist-tags.latest (Kompatibilitäts-Wrapper, v1.5.0). */
+async function npmLatest(pkg: string): Promise<string | null> {
+  const p = await npmPackument(pkg);
+  return p?.['dist-tags']?.latest ?? null;
+}
+
+/**
+ * Neuester Kanal-kompatibler Pre-Release-Kandidat (v1.6.0, N2): höchste Version
+ * aus den dist-tags mit `-beta`/`-rc`/`-alpha`, die NEUER als `current` ist und
+ * im selben Kanal liegt. Exoten (`next`, `dev`, `insiders`) werden nur bei
+ * SHOW_EXOTIC_PRERELEASES berücksichtigt. NIE Bump-Ziel — nur Info.
+ */
+function betaCandidate(
+  current: string,
+  distTags: Record<string, string> | undefined
+): string | null {
+  if (!distTags) return null;
+  const cur = semver.coerce(current);
+  const candidates: string[] = [];
+  for (const [tag, version] of Object.entries(distTags)) {
+    if (!semver.valid(version)) continue;
+    if (semver.prerelease(version) === null) continue;
+    const cls = classifyPrerelease(version);
+    if (cls.cls === 'exotic' && !showExoticPrereleases()) continue;
+    if (!channelCompatible(current, version)) continue;
+    const v = semver.coerce(version);
+    if (cur && v && !semver.gt(v, cur)) continue;
+    // `next`/`dev`-dist-tags sind oft Build-Snapshots; nur bei explicitem Opt-in
+    if (cls.cls === 'exotic' && !/^(next|dev|insiders|canary|nightly)$/i.test(tag)) continue;
+    candidates.push(version);
+  }
+  if (candidates.length === 0) return null;
+  return candidates.sort((a, b) => semver.rcompare(a, b))[0] ?? null;
 }
 
 /**
@@ -132,23 +200,63 @@ export async function collectPinning(repo: RepoInfo, repoDir: string): Promise<P
       const deps = json[section];
       if (!deps || typeof deps !== 'object') continue;
       for (const [pkg, spec] of Object.entries(deps as Record<string, unknown>)) {
-        if (!isFloatingSpec(spec)) continue;
-        const latest = await npmLatest(pkg);
-        findings.push({
+        const floating = isFloatingSpec(spec);
+        const betaPinned = !floating && isPinnedPrereleaseSpec(spec);
+        if (!floating && !betaPinned) continue;
+        const packument = await npmPackument(pkg);
+        const latest = packument?.['dist-tags']?.latest ?? null;
+        const finding: PinFinding = {
           pkg,
-          current: spec,
-          latest,
+          current: typeof spec === 'string' ? spec.trim() : String(spec),
+          // betaPinned: kein "latest exact"-Ziel (stable != Beta-Kanal), sondern
+          // der Kanal-Nachbar aus prereleaseHint.
+          latest: floating ? latest : null,
           section,
           manifestPath: rel,
           severity: section === 'dependencies' ? 'warn' : 'info',
-        });
+        };
+        // Soaking (v1.6.0): Alter des Ziel-Kandidaten bestimmen. latest ist kein
+        // CVE-Fix (kein Advisory-Bezug im Pinning-Pfad) → nur die 3-Tage-Regen.
+        if (floating && latest) {
+          const pub = await npmVersionPublishedAt(pkg, latest);
+          const el = updateEligibility({
+            variantChange: false,
+            publishedAt: pub.publishedAt,
+            cveFix: false,
+          });
+          finding.latestPublishedAt = pub.publishedAt;
+          finding.eligibility = el.eligibility;
+          finding.eligibilityLabel = el.label;
+          finding.ageDays = el.ageDays;
+        }
+        // Beta-Hinweis (v1.6.0, N2): NUR für Pakete, die schon auf einem
+        // Beta/RC-Kanal liegen — und nur Bericht, nie Bump-Ziel.
+        if (betaPinned) {
+          const beta = betaCandidate(finding.current, packument?.['dist-tags']);
+          if (beta) {
+            finding.prereleaseHint = beta;
+            const pub = await npmVersionPublishedAt(pkg, beta);
+            const el = updateEligibility({
+              variantChange: false,
+              publishedAt: pub.publishedAt,
+              cveFix: false,
+            });
+            finding.prereleasePublishedAt = pub.publishedAt;
+            finding.prereleaseEligibility = el.eligibility;
+            finding.prereleaseLabel = el.label;
+          }
+        }
+        findings.push(finding);
       }
     }
   }
 
   const fixable = findings.filter((f) => {
     if (!PR_SECTIONS.includes(f.section)) return false; // optional/peer = report-only
-    if (!f.latest) return false;
+    if (!f.latest) return false; // deckt auch betaPinned (latest=null) ab
+    // Soaking (v1.6.0): nur reife Ziel-Versionen werden gepinnt. Zu junge
+    // Kandidaten bleiben im Report ("zu jung (2d)") und warten auf den nächsten Lauf.
+    if (f.eligibility === 'too-young') return false;
     // Downgrade-Guard: latest muss >= (Major) der floating Referenz liegen
     const curCoerced = semver.coerce(f.current);
     const latestCoerced = semver.valid(f.latest) ? semver.coerce(f.latest) : null;

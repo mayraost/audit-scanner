@@ -96,8 +96,11 @@ Pipeline je Nachtlauf (bzw. manueller Trigger):
    `.heartbeat` wird getoucht (HEALTHCHECK akzeptiert Alter < 48 h).
 10. **Telegram**: Nachricht nur, wenn **neue Findings** vorliegen **oder**
     offene CVE/Pins-PRs existieren (Reminder-Sektion zuerst, danach nur neue
-    Findings; nur Reminders → kompakte Kurznachricht). Weder noch → kein
-    Versand, nur Log. Image-PRs wurden bewusst ab v1.4.0 **ohne** daily
+    Findings; nur Reminders → kompakte Kurznachricht). „Neue Findings“ umfasst
+    seit v1.5.2 auch **novel Base-Image-CVEs** (geänderte H/C-Zahl je
+    Repo+Image gegenüber `state.json`) — eigene Sektion
+    `🛡 Image-Vulns (Base-Image)`. Weder noch → kein Versand, nur Log.
+    Image-PRs wurden bewusst ab v1.4.0 **ohne** daily
     Reminder gebaut (kurzlebig). Ohne Telegram-Config wird der Versand still
     übersprungen (Scan läuft trotzdem).
 
@@ -166,6 +169,23 @@ Je Repo dedupliziert (Ref über alle Files gemerged), dann:
    mit Note. Andere Registries (`gcr.io`, `quay.io`, `registry.k8s.io`, …)
    werden von trivy gescannt, aber der Freshness-Check bleibt Docker Hub +
    GHCR vorbehalten.
+   **Variant-Regel (token-basiert, seit v1.6.0):** Die Variante wird an `-`
+   in Tokens zerlegt; ein Kandidat gilt nur dann als *gleiche* Variante, wenn
+   die Tokens des current-Tags Präfix der Kandidaten-Tokens sind und höchstens
+   **ein** zusätzlicher Token dabei ist, der ein bekanntes OS-Release
+   (`alpine3.24`, `trixie`, `bookworm`, `bullseye`, `noble`, `jammy`, `slim`, …)
+   ist. Damit matcht `node:26.13.0-alpine3.24` weiter exakt, `slim` erkennt
+   `slim-trixie` als **OS-Basis-Wechsel** — und `pg17` matcht **nicht**
+   `pg17-trixie` als Versions-Update. Bewusst restriktiv: lieber kein
+   „update verfügbar“ als ein falscher Bump.
+   **`variantDrift`-Marker:** Existiert ein semver-identischer Tag mit anderer
+   OS-Basis (z. B. `0.8.7-pg17` → `0.8.7-pg17-trixie`), setzt der Scan das
+   Feld `variantDrift` (Kandidaten-Tag) am Finding. Das ist **report-only**:
+   **kein** Bump-Plan und **kein** PR (Variant-/OS-Wechsel ist ein Risiko,
+   keine Update-Empfehlung). `strictlyNewer()` vergleicht ausschließlich den
+   Zahlen-Teil und ist bei semver-Gleichheit immer `false`; `newestSameMajor`
+   ist per Konstruktion **nie semver-kleiner** als der current-Tag (sonst
+   fällt der Report auf `exaktPin` bzw. `—` zurück).
 3. **Fix-PR-Policy (v1.5.0)**:
    - **Exakte Tags** (`x.y.z`, z. B. `aquasec/trivy:0.76.1`) mit verfügbarer
      streng neuerer Version im selben Major → Tag-Bump-PR
@@ -179,6 +199,20 @@ Je Repo dedupliziert (Ref über alle Files gemerged), dann:
    (Image | current | newest | Vulns H/C | Status); Image-PRs erscheinen als
    eigene `imagePrs`-Summary-Zeile und als State-Eintrag `kind: "image"`
    (ohne CVE-Reminder).
+5. **Base-Image-CVEs als eigene Findings (v1.5.2)**: jedes Image mit
+   `high+critical > 0` erscheint als `imageVulnFindings`-Eintrag im Report
+   (`repo`, `image`, `sourceFiles`, `high`, `critical`; sortiert nach
+   `critical`, `high`, `image`) und als Summary-Zähler
+   `Image-Vulns: H<n>/C<n> (n Images)` — auch für **gepinnte + aktuelle**
+   Images, für die kein Image-PR möglich ist. Telegram meldet sie in der
+   eigenen Sektion `🛡 Image-Vulns (Base-Image)` **nur bei neuen Zahlen**
+   (Novelty-Register `imageVulns` in `state.json`: `repo → image →
+   "H<h>/C<c>"`; Abweichung oder unbekanntes Image = neu, max. 15 Zeilen).
+   Das Register wird erst **nach erfolgreichem** Telegram-Versand
+   fortgeschrieben — bei Telegram-Fehler wird erneut gemeldet. Mit
+   `ENABLE_FIX_PRS=0` gibt es keinen State: alle Einträge gelten als novel
+   (nur Report), kein State-Write. Die 🐳-Sektion filtert weiterhin
+   update/floating und zeigt weiter **keine** gepinnten+aktuellen Images.
 
 ## 📌 Pinning-Enforcement (seit v1.5.0)
 
@@ -206,9 +240,56 @@ gescanntem Repo:
    via corepack `--lockfile-only`); Nested-Manifests ohne Lockfile im selben
    Verzeichnis → manuelle Regen-Note.
 5. **Report/Telegram**: Report-Sektion `📌 Unpinned deps (package.json)` je
-   Repo (`pkg | current ^1.2.3 | latest exact X.Y.Z | scope | sev`), Summary
-   `unpinned deps: N` + `pinsPrs`-Zähler, Telegram `📌 Unpinned deps`-Block +
-   `Pins-PRs diesmal: …`. State-Eintrag `kind: "pins"` (mit Reminder).
+   Repo (`pkg | current ^1.2.3 | latest exact X.Y.Z | scope | sev | soaking |
+   beta`), Summary `unpinned deps: N` + `pinsPrs`-Zähler, Telegram `📌 Unpinned
+   deps`-Block + `Pins-PRs diesmal: …`. State-Eintrag `kind: "pins"` (mit Reminder).
+
+## ⏳ Soaking & Beta-Erkennung (seit v1.6.0)
+
+Ziel: **kein Update auf eine frisch publizierte Version** — Schutz gegen
+Package-Poisoning (kompromittierte Releases werden typischerweise innerhalb
+von Stunden nach Publish entdeckt und zurückgezogen).
+
+**Regel 1 — 3-Tage-Reife.** Ein Update (npm-Pin *und* Image-Tag-Bump) wird erst
+angeboten, wenn die **Zielversion** mindestens `UPDATE_MIN_AGE_DAYS` (= 3) Tage
+alt ist. Die Prüfung ist **rein deterministisch** (kein State): ein heute
+2 Tage alter Kandidat ist morgen 3 Tage alt und wird dann angeboten.
+
+Datenquellen (alle ohne Docker-Daemon, nur HTTP):
+
+| Ökosystem | Quelle | Feld |
+|---|---|---|
+| npm | `registry.npmjs.org/<pkg>` | `time[<version>]` |
+| Docker Hub | `hub.docker.com/v2/repositories/<repo>/tags/<tag>` | `tag_last_pushed` |
+| GHCR | `ghcr.io/v2/<repo>/manifests/<tag>` | OCI-Annotation `org.opencontainers.image.created` |
+| PyPI | `pypi.org/pypi/<pkg>/json` | `releases[<v>][0].upload_time_iso_8601` |
+
+Unbekanntes Datum (private Registry, fehlende Annotation) → **fail-open**
+(Update erlaubt, als „unbekanntes Alter“ markiert), damit nichts still hängt.
+
+**Regel 2 — einzige Ausnahme: belegter CVE-Fix.** Ein HIGH/CRITICAL-*Fix*
+umgeht die Wartezeit — Status `cve-exempt`. Bewusst **streng**:
+
+- Paket-Scan: `advisory.firstPatched` entspricht der Zielversion.
+- Image-Scan: **nur** Security-Tools (`aquasec/trivy`, `anchore/grype|syft`),
+  deren jedes Release Vulnerability-/Signatur-Daten ausliefert.
+- Ein Base-Image-Patch-Bump (`node:26.13 → 26.14`) ist **keine** Ausnahme —
+  er beweist keinen CVE-Fix.
+
+Status im Report: `✓ reif (5d)` · `⏳ zu jung (2d)` · `🔴 CVE-Fix, sofort` ·
+`⛔ Variant-Wechsel — kein Update`.
+
+**Regel 3 — Beta-Hinweis nur für Beta-Pakete.** Ein Pre-Release-Kandidat
+(`-beta`, `-rc`, `-alpha`) wird **ausschließlich dann** gemeldet, wenn das Paket
+**bereits** auf einem Beta/RC-Kanal liegt — und dann nur im **selben Kanal**
+(`rc → rc`, nicht `rc → beta`, nie `stable → beta`). Beta-Updates sind immer
+**info-only**: nie Bump-Ziel, nie Pins-PR, nie Image-Bump. Nightly/Canary/
+Dev/Insiders (`prerelease-exotic`) sind standardmäßig stumm
+(`SHOW_EXOTIC_PRERELEASES=1` zum Zeigen).
+
+Telegram: `ℹ️ Beta/RC-Updates (Paket bereits im Beta-Kanal)` — nur für Kandidaten
+mit Soaking-Reife. Zu junge Updates erscheinen im Alert als
+`⏳ zu jung (2d) (Report)`, also ohne Handlungsaufforderung.
 
 ## Installation & Setup
 
@@ -266,6 +347,8 @@ Lokal ohne Docker braucht ein voller `scan` zusätzlich `trivy` im PATH.
 | `TRIVY_BIN`          | nein | `trivy` | Pfad zum Trivy-Binary. |
 | `TRIVY_CACHE_DIR`    | nein | `<WORK_DIR>/.cache/trivy` | Trivy-DB-Cache (im Container im Volume `audit-cache`). |
 | `WORK_DIR` / `REPORTS_DIR` | nein | `/app` / `<WORK_DIR>/reports` | Pfad-Konventionen (Container-Setup); Report-Unterverzeichnisse je Tag. |
+| `UPDATE_MIN_AGE_DAYS` | nein | `3` | **Soaking** (v1.6.0): Ein Update wird erst angeboten/gepinnt, wenn die Zielversion so viele **Tage** alt ist (Schutz gegen Package-Poisoning). `0` = aus. Alternative **nur** bei belegtem HIGH/CRITICAL-CVE-Fix. |
+| `SHOW_EXOTIC_PRERELEASES` | nein | `0` | `1` = Nightly/Canary/Dev/Insiders-Kandidaten zusätzlich im Report zeigen (Default aus, Rauschkontrolle). |
 
 **Item-Level-Skip**: Datei `.cve-audit-skip` im Repo-Root (wird im Inventar
 erkannt; Repo erscheint als `skip(repo-file)`). **`SKIP_REPOS`** klammert Repos
@@ -282,6 +365,8 @@ npm run scan           # build + voller Durchlauf (Scan + Telegram + Fix-PRs)
 npm run inventory      # Inventarlisting (Repos + erkannte Ökosysteme)
 npm run test-telegram  # 1 Config-Testnachricht an Telegram
 npm run state-test     # PR-Dedupe-State Selbsttest
+npm run image-vulns-test # Image-Vuln-Findings/Novelty-Selbsttest (synthetisch)
+npm run image-freshness-test # Image-Tag-Freshness (Variant-Matching) Selbsttest
 ```
 
 Direkte Kommandos (nach `npm run build`):
@@ -296,6 +381,8 @@ node dist/index.js inventory
 node dist/index.js test-telegram
 node dist/index.js triage-test  # LLM-Triage mit 2 Fake-Findings (kein Scan/Telegram)
 node dist/index.js state-test   # State-Dedupe-Selbsttest (simuliert, Fake-Branch)
+node dist/index.js image-vulns-test # Image-Vuln-Novelty-Selbsttest (synthetisch)
+node dist/index.js image-freshness-test # Variant-Matching/Freshness (kein Netz)
 ```
 
 Achtung: `scan` ist ein echter Lauf (Trivy-Downloads, API-Calls, bei
@@ -377,6 +464,13 @@ Kompakte Release-Historie (git history; Version in package.json):
 - `state-test` — simuliertes State + PR-Status-Check gegen
   `mayraost/audit-scanner` mit nicht existierendem Fake-Branch (keine echten
   PRs, kein Telegram-Versand).
+- `image-vulns-test` — synthetische Report-/State-Objekte: Legacy-`state.json`
+  ohne `imageVulns`-Feld parst, Novelty-Regel (erster Lauf / unverändert /
+  geänderte H/C-Zahl) und Telegram-🛡-Sektion inkl. 15-Zeilen-Kappung.
+- `image-freshness-test` — Image-Tag-Freshness ohne Netzwerk: Variant-
+  Token-Matching (`alpine` → `alpine3.24` ja, `pg17` → `pg17-trixie` nein),
+  `variantDrift`, `strictlyNewer`-Invariante (semver-gleich = false) und
+  „pinned never DOWN into floating“.
 - `triage-test` — LLM-Triage mit 2 Fake-Findings (kein Scan, kein Telegram).
 - `test-telegram` — 1 Config-Testnachricht (à la Smoke-Test) an den
   konfigurierten Chat.

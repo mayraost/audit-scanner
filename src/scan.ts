@@ -29,7 +29,9 @@ import {
   ageDays,
   entriesForRepo,
   isKnownFinding,
+  isNovelImageVuln,
   loadState,
+  markImageVulnsReported,
   reconcileRepo,
   saveState,
   upsertEntry,
@@ -38,6 +40,7 @@ import {
 } from './state.js';
 import { sendTelegramReport } from './telegram.js';
 import { llmEnabled, triageFindings, type TriageDecision, type TriageInput } from './llm.js';
+import { eligibilityBadge } from './soaking.js';
 
 const execFileP = promisify(execFile);
 
@@ -94,6 +97,19 @@ export interface ReminderInfo {
   findings: StateFinding[]; // offene CVEs (ghsaId + package) laut State-Eintrag
 }
 
+/**
+ * Image-Vuln-Finding (v1.5.2): Base-Image-CVEs je Repo+Image, aggregiert über
+ * alle Repos — eigene, gezählte Findings statt nur Tabellenzeile. Nur Einträge
+ * mit high+critical > 0.
+ */
+export interface ImageVulnFinding {
+  repo: string;
+  image: string;
+  sourceFiles: string[];
+  high: number;
+  critical: number;
+}
+
 export interface Report {
   generatedAt: string;
   owner: string;
@@ -108,9 +124,11 @@ export interface Report {
     unpinned: number; // alle observed floatingSpecifier (deps+dev+optional+peer)
     apiCalls: number;
     reminders: number; // offene Fix-PRs (Reminder-Sektion)
+    imageVulns: { high: number; critical: number; images: number }; // Summe Base-Image-CVEs
   };
   reminders: ReminderInfo[]; // offene CVE-Fix-PRs (⏰-Sektion)
   pinsReminders: ReminderInfo[]; // offene Pins-PRs (📌-Sektion, findings leer) — JEDEN Lauf erwähnen
+  imageVulnFindings: ImageVulnFinding[]; // Base-Image-CVEs (v1.5.2), sortiert crit/high/image
   repos: RepoResult[];
 }
 
@@ -258,6 +276,7 @@ export async function runScan(opts: {
     fs.rmSync(scanTmp, { recursive: true, force: true });
   }
 
+  const imageVulns = collectImageVulnFindings(results);
   const report: Report = {
     generatedAt: new Date().toISOString(),
     owner: OWNER,
@@ -272,13 +291,22 @@ export async function runScan(opts: {
       unpinned: results.reduce((n, r) => n + (r.pins?.length ?? 0), 0),
       apiCalls: ghStats.apiCalls,
       reminders: collectReminders(state).length,
+      imageVulns: {
+        high: imageVulns.reduce((n, f) => n + f.high, 0),
+        critical: imageVulns.reduce((n, f) => n + f.critical, 0),
+        images: imageVulns.length,
+      },
     },
     reminders: collectReminders(state),
     pinsReminders: collectPinsReminders(state),
+    imageVulnFindings: imageVulns,
     repos: results,
   };
 
-  // State persistieren (lastSeen-Updates + ggf. neu angelegte PR-Einträge)
+  // State persistieren (lastSeen-Updates + ggf. neu angelegte PR-Einträge).
+  // imageVulns-Register wird bewusst HIER NOCH NICHT fortgeschrieben — erst
+  // nach erfolgreichem Telegram-Versand (sendTelegramFromReport), sonst gingen
+  // Novel-Findings bei Telegram-Fehler/Deploy-Neustart verloren.
   if (opts.fixPrs) saveState(state);
 
   // Report-Ablage + Heartbeat (auch wenn Telegram skip). --only-Run (Probe-Lauf)
@@ -291,8 +319,38 @@ export async function runScan(opts: {
   fs.writeFileSync(HEARTBEAT_FILE, new Date().toISOString());
   log(`Report geschrieben: ${outDir}${suffix ? ` (report${suffix}.* — --only-Run, Full-Scan-Report unangetastet)` : ''}`);
 
-  if (opts.sendTelegram) await sendTelegramFromReport(report);
+  if (opts.sendTelegram) await sendTelegramFromReport(report, state, opts.fixPrs);
   return report;
+}
+
+/**
+ * Base-Image-CVEs (v1.5.2) als eigene Findings: je Repo+Image nur Einträge mit
+ * high+critical > 0, sortiert absteigend nach (critical, high, image).
+ * Reine Projektion der Image-Scan-Ergebnisse — keine Zusatz-Calls.
+ */
+export function collectImageVulnFindings(repos: RepoResult[]): ImageVulnFinding[] {
+  const out: ImageVulnFinding[] = [];
+  for (const r of repos) {
+    for (const f of r.images ?? []) {
+      const high = f.vulns.high;
+      const critical = f.vulns.critical;
+      if (high + critical === 0) continue;
+      out.push({
+        repo: r.name,
+        image: f.image,
+        sourceFiles: [...f.sourceFiles],
+        high,
+        critical,
+      });
+    }
+  }
+  return out.sort(
+    (a, b) =>
+      b.critical - a.critical ||
+      b.high - a.high ||
+      a.image.localeCompare(b.image) ||
+      a.repo.localeCompare(b.repo)
+  );
 }
 
 /** Trivy-Type → Manifest-Ökosystem Fallback (wenn Target-Bname unbekannt). */
@@ -661,6 +719,9 @@ function onlyReportSuffix(repos: string[]): string {
 }
 
 function renderMarkdown(report: Report): string {
+  const iv = report.summary.imageVulns;
+  // Image-Vuln-Zähler nur bei > 0 — bestehende Optik nicht aufblähen.
+  const imageVulnPart = iv.images > 0 ? ` · Image-Vulns: H${iv.high}/C${iv.critical} (${iv.images} Images)` : '';
   const summaryLine =
     `*Repos*: ${report.summary.reposTotal} total / ${report.summary.scanned} gescannt · ` +
     `high/critical-Advisory-Funde: ${report.summary.findings} · LLM-suppressed: ${report.summary.suppressed} · ` +
@@ -668,7 +729,8 @@ function renderMarkdown(report: Report): string {
     `${report.summary.imagePrs ? ` (+${report.summary.imagePrs} Image)` : ''}` +
     `${report.summary.pinsPrs ? ` (+${report.summary.pinsPrs} Pins)` : ''} · ` +
     `unpinned deps: ${report.summary.unpinned} · ` +
-    `offene Fix-PRs (Reminder): ${report.summary.reminders} · ` +
+    `offene Fix-PRs (Reminder): ${report.summary.reminders}` +
+    `${imageVulnPart} · ` +
     `GitHub-API-Calls: ${report.summary.apiCalls}`;
   const lines: string[] = [
     `# CVE-Audit-Report (mayraost)`,
@@ -721,14 +783,20 @@ function renderMarkdown(report: Report): string {
 
 /** 📌-Sektion je Repo (Report-MD): floating npm-Specifier (v1.5.0 Enforcement). */
 function pinningTable(pins: PinFinding[]): string {
-  const rows = pins.map(
-    (p) =>
-      `| ${p.pkg} | ${p.current} | ${p.latest ?? '—'} | ${p.section} | ${p.severity} |`
-  );
+  const rows = pins.map((p) => {
+    // v1.6.0: Soaking-Status (reif / zu jung) + Beta-Hinweis (nur Info).
+    const soak = p.eligibility
+      ? eligibilityBadge({ eligibility: p.eligibility, ageDays: p.ageDays ?? null, label: p.eligibilityLabel ?? '' })
+      : '—';
+    const beta = p.prereleaseHint
+      ? `ℹ️ ${p.prereleaseHint} (${p.prereleaseLabel ?? '?'})`
+      : '—';
+    return `| ${p.pkg} | ${p.current} | ${p.latest ?? '—'} | ${p.section} | ${p.severity} | ${soak} | ${beta} |`;
+  });
   return [
     '### 📌 Unpinned deps (package.json) — Floating-Specifier',
-    '| Package | Current | Latest exact | Scope | Sev |',
-    '|---|---|---|---|---|',
+    '| Package | Current | Latest exact | Scope | Sev | Soaking | Beta/RC |',
+    '|---|---|---|---|---|---|---|',
     ...rows,
   ].join('\n');
 }
@@ -738,12 +806,28 @@ function imageTable(images: ImageFinding[]): string {
   const rows: string[] = [];
   for (const f of images) {
     const vc = `H${f.vulns.high}/C${f.vulns.critical}`;
+    // v1.6.0: Soaking-Status ("reif (5d)" / "zu jung (2d)" / "CVE-Fix, sofort").
+    const soak = f.eligibility
+      ? eligibilityBadge({ eligibility: f.eligibility, ageDays: f.ageDays ?? null, label: f.eligibilityLabel ?? '' })
+      : '';
     if (f.note) {
       rows.push(`| ${f.image} | — | — | — | ${f.note} |`);
     } else if (f.updateAvailable) {
-      rows.push(`| ${f.image} | ${f.current} | ${f.newestSameMajor} | ${vc} | ⚠️ update verfügbar |`);
+      const status =
+        f.eligibility === 'too-young'
+          ? `⏳ update verfügbar, aber ${f.eligibilityLabel}`
+          : `⚠️ update verfügbar${soak ? ` (${soak})` : ''}`;
+      rows.push(`| ${f.image} | ${f.current} | ${f.newestSameMajor} | ${vc} | ${status} |`);
     } else if (f.floating && f.exactPin) {
-      rows.push(`| ${f.image} | ${f.current} | ${f.exactPin} | ${vc} | floating → pin ${f.exactPin} |`);
+      const status =
+        f.eligibility === 'too-young'
+          ? `floating → pin ${f.exactPin} (⏳ ${f.eligibilityLabel})`
+          : `floating → pin ${f.exactPin}`;
+      rows.push(`| ${f.image} | ${f.current} | ${f.exactPin} | ${vc} | ${status} |`);
+    } else if (f.variantDrift) {
+      // v1.6.0: semver-gleicher Tag mit anderer OS-Basis (pg17 → pg17-trixie,
+      // slim → slim-bookworm). Kein Bump/PR — nur Sichtbarkeit im Report.
+      rows.push(`| ${f.image} | ${f.current} | — | ${vc} | variant drift: ${f.variantDrift} |`);
     } else {
       rows.push(
         `| ${f.image} | ${f.current} | ${f.newestSameMajor ?? '—'} | ${vc} | ` +
@@ -759,11 +843,30 @@ function imageTable(images: ImageFinding[]): string {
   ].join('\n');
 }
 
-async function sendTelegramFromReport(report: Report): Promise<void> {
+/**
+ * Novel Image-Vulns (v1.5.2): Findings, deren (high, critical) sich vom State-
+ * Register unterscheiden ODER die im Register fehlen. State = undefined/leer
+ * (erster Lauf, ENABLE_FIX_PRS=0) → ALLE Findings sind novel (nur Report,
+ * kein State-Write).
+ */
+export function novelImageVulns(
+  report: Report,
+  state: State | undefined
+): Array<ImageVulnFinding & { novel: true }> {
+  return report.imageVulnFindings
+    .filter((f) => !state || isNovelImageVuln(state, f.repo, f.image, f.high, f.critical))
+    .map((f) => ({ ...f, novel: true as const }));
+}
+
+async function sendTelegramFromReport(report: Report, state: State, fixPrs: boolean): Promise<void> {
   const date = parseIsoDateKey(new Date(report.generatedAt));
+  // Novel-Register nur mit echtem State (ENABLE_FIX_PRS=1) — sonst alle novel.
+  const novel = novelImageVulns(report, fixPrs ? state : undefined);
   const hasNew =
     report.repos.some((r) => r.findings.some((f) => !isSuppressed(f))) ||
     report.repos.some((r) => r.images?.some((i) => i.updateAvailable) ?? false) ||
+    // Base-Image-CVEs zählen nur, wenn SIE neu sind/ihre Zahl sich geändert hat.
+    novel.length > 0 ||
     // Neue Pins-PRs / neue exakte Image-Pinning-Bumps zählen als "neu" (v1.5.0)
     report.repos.some((r) => r.pinsPr?.status === 'created') ||
     report.repos.some((r) => r.imagePr?.status === 'created');
@@ -774,9 +877,24 @@ async function sendTelegramFromReport(report: Report): Promise<void> {
     return;
   }
   const title = `🔐 CVE-Audit ${date} (mayraost)`;
-  const body = telegramBody(report, hasNew);
-  await sendTelegramReport(title, body);
+  const body = telegramBody(report, hasNew, novel);
+  const sent = await sendTelegramReport(title, body);
+  // Register erst NACH erfolgreichem Versand fortschreiben und sofort
+  // persistieren — sonst würde ein Telegram-Fehler die Novel-Meldung beim
+  // nächsten Lauf verschlucken (ohne Fix-PRs: kein State, kein Write).
+  if (sent && novel.length > 0) {
+    for (const repo of new Set(novel.map((n) => n.repo))) {
+      markImageVulnsReported(
+        state,
+        repo,
+        novel.filter((n) => n.repo === repo).map((n) => ({ image: n.image, high: n.high, critical: n.critical }))
+      );
+    }
+    if (fixPrs) saveState(state);
+  }
+  if (!sent) log('WARN: Telegram-Versand fehlgeschlagen — Image-Vuln-Register NICHT fortgeschrieben (nächster Lauf meldet erneut).');
 }
+
 
 /** Reminder-Sektion: offene CVE-Fix-PRs + offene Pins-PRs (Alt in Tagen, kompakt). */
 function reminderLines(report: Report): string[] {
@@ -798,7 +916,44 @@ function reminderLines(report: Report): string[] {
   return lines;
 }
 
-function telegramBody(report: Report, hasNewFindings: boolean): string {
+/** Max. Zeilen in der 🛡-Sektion; Rest wird zu "… +N weitere (Report)". */
+export const IMAGE_VULN_TELEGRAM_MAX_LINES = 15;
+
+/**
+ * 🛡-Sektion "Image-Vulns (Base-Image)" (v1.5.2): NUR die novel Image-Vulns
+ * (neue H/C-Zahl je Repo+Image), gruppiert je Repo, gekappt auf
+ * IMAGE_VULN_TELEGRAM_MAX_LINES Zeilen. Leer wenn keine novel Einträge.
+ */
+export function imageVulnLines(
+  novel: Array<Pick<ImageVulnFinding, 'repo' | 'image' | 'high' | 'critical'>>
+): string[] {
+  if (novel.length === 0) return [];
+  const lines: string[] = [];
+  let shown = 0;
+  for (const repo of [...new Set(novel.map((n) => n.repo))]) {
+    const entries = novel.filter((n) => n.repo === repo);
+    if (shown >= IMAGE_VULN_TELEGRAM_MAX_LINES) break;
+    lines.push(`*${repo}*:`);
+    for (const e of entries) {
+      if (shown >= IMAGE_VULN_TELEGRAM_MAX_LINES) break;
+      lines.push(
+        `  • ${e.image} [H${e.high}/C${e.critical}] → Rebuild/Base-Image aktualisieren oder Fix-Version prüfen`
+      );
+      shown++;
+    }
+    lines.push('');
+  }
+  const rest = novel.length - shown;
+  if (rest > 0) lines.push(`  … +${rest} weitere (Report)`);
+  while (lines.at(-1) === '') lines.pop();
+  return lines;
+}
+
+export function telegramBody(
+  report: Report,
+  hasNewFindings: boolean,
+  novelImageVulns: Array<Pick<ImageVulnFinding, 'repo' | 'image' | 'high' | 'critical'>> = []
+): string {
   const lines: string[] = [];
   const totalCount = report.repos.reduce((n, r) => n + r.findings.length, 0);
   const suppressedCount = report.repos.reduce((n, r) => n + r.findings.filter(isSuppressed).length, 0);
@@ -832,27 +987,36 @@ function telegramBody(report: Report, hasNewFindings: boolean): string {
   if (suppressedCount > 0) {
     lines.push(`🔇 LLM-suppressed: ${suppressedCount}/${totalCount} Funde (Details im Report „LLM-suppressed“-Sektion).`);
   }
-  // 🐳 Image-Sektion: nur relevante Einträge — Update verfügbar oder floating
-  // (Pin-Enforcement/„Rebuild aktualisiert"). Pinned+aktuelle Images sind raus,
-  // auch wenn sie Base-Image-Vulns haben (kein PR möglich, nur Rauschen).
+  // 🐳 Image-Sektion: nur relevante Einträge — Update verfügbar, floating
+  // (Pin-Enforcement/„Rebuild aktualisiert") oder variantDrift (v1.5.2:
+  // semver-gleicher Tag mit anderer OS-Basis, report-only). Pinned+aktuelle
+  // Images sind raus, auch wenn sie Base-Image-Vulns haben (→ 🛡-Sektion).
   // Repo hat offenen Image-PR → Section trotzdem zeigen (PR-Kontext).
   const imgRepos = report.repos.filter(
     (r) =>
       !!r.imagePr?.prUrl ||
-      r.images?.some((i) => !i.note && (i.updateAvailable || i.floating))
+      r.images?.some((i) => !i.note && (i.updateAvailable || i.floating || !!i.variantDrift))
   );
   if (imgRepos.length > 0) {
     lines.push('🐳 Image-Scan (Dockerfile/compose):');
     for (const r of imgRepos) {
       lines.push(`*${r.name}*:`);
       for (const f of r.images!) {
-        // skip: unscannable (note) sowie pinned+aktuell ohne Update (auch mit Vulns)
-        if (f.note || (!f.updateAvailable && !f.floating)) continue;
+        // skip: unscannable (note) sowie pinned+aktuell ohne Update/Drift (auch mit Vulns)
+        if (f.note || (!f.updateAvailable && !f.floating && !f.variantDrift)) continue;
         const vc = `H${f.vulns.high}/C${f.vulns.critical}`;
-        if (f.updateAvailable) {
-          lines.push(`  • ${f.image} → ${f.newestSameMajor} ⚠️ update verfügbar [${vc}]`);
+        // v1.6.0 Soaking: zu junge Kandidaten werden im Alert NICHT als Aktion
+        // gezeigt (nur Report) — Package-Poisoning-Schutz.
+        if (f.updateAvailable && f.eligibility === 'too-young') {
+          lines.push(`  • ${f.image} → ${f.newestSameMajor} ⏳ ${f.eligibilityLabel} (Report) [${vc}]`);
+        } else if (f.updateAvailable) {
+          const badge = f.eligibility === 'cve-exempt' ? ' 🔴 CVE-Fix' : '';
+          lines.push(`  • ${f.image} → ${f.newestSameMajor} ⚠️ update verfügbar${badge} [${vc}]`);
         } else if (f.floating && f.exactPin) {
-          lines.push(`  • ${f.image} → pin ${f.exactPin} [${vc}]`);
+          const badge = f.eligibility === 'too-young' ? ` ⏳ ${f.eligibilityLabel}` : '';
+          lines.push(`  • ${f.image} → pin ${f.exactPin}${badge} [${vc}]`);
+        } else if (f.variantDrift) {
+          lines.push(`  • ${f.image} [${vc}] — variant drift: ${f.variantDrift} (report-only)`);
         } else {
           lines.push(
             `  • ${f.image} [${vc}] — ${f.pinned ? 'pinned, aktuell' : 'floating (Rebuild aktualisiert)'}`
@@ -862,6 +1026,32 @@ function telegramBody(report: Report, hasNewFindings: boolean): string {
       if (r.imagePr?.prUrl) lines.push(`  🛠 Image-PR: ${r.imagePr.prUrl}`);
       lines.push('');
     }
+  }
+  // ℹ️ Beta-Hinweise (v1.6.0, N2): NUR für Pakete, die bereits auf einem
+  // Beta/RC-Kanal liegen — keine "es gibt eine Beta"-Werbung für stabile Pakete.
+  // Zusätzlich muss der Kandidat die Soaking-Reife haben (kein Rauschen).
+  const betaLines: string[] = [];
+  for (const r of report.repos) {
+    const betas = (r.pins ?? []).filter(
+      (p) => p.prereleaseHint && p.prereleaseEligibility === 'eligible'
+    );
+    if (betas.length === 0) continue;
+    betaLines.push(`*${r.name}*:`);
+    for (const p of betas) {
+      betaLines.push(`  • ${p.pkg} ${p.current} → ${p.prereleaseHint} (${p.prereleaseLabel ?? '?'})`);
+    }
+  }
+  if (betaLines.length > 0) {
+    lines.push(['ℹ️ Beta/RC-Updates (Paket bereits im Beta-Kanal):', ...betaLines].join('\n'));
+    lines.push('');
+  }
+  // 🛡 Base-Image-Vulns (v1.5.2) — SEPARAT von der 🐳-Sektion: hier landen die
+  // CVEs gepinnter+aktueller Images, die oben bewusst gefiltert werden. Nur
+  // NOVEL-Einträge (State-Register), damit kein Spam bei jedem Lauf.
+  const ivLines = imageVulnLines(novelImageVulns);
+  if (ivLines.length > 0) {
+    lines.push(['🛡 Image-Vulns (Base-Image):', ...ivLines].join('\n'));
+    lines.push('');
   }
   // Nur echte Fehler erwähnen — skipped-Repos (z. B. kein scanbares Manifest)
   // sind normal und erzeugen sonst nur Rauschen.

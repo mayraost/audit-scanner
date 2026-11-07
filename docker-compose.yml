@@ -19,6 +19,10 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepinfra.com/v1/openai}
       # Cron in Container-Zeit (TZ=Europe/Berlin im Image): 16:00 Ortszeit.
       CRON_SCHEDULE: ${CRON_SCHEDULE:-0 16 * * *}
+      # Soaking: Updates erst nach N Tagen (Package-Poisoning-Schutz). 0 = aus.
+      UPDATE_MIN_AGE_DAYS: ${UPDATE_MIN_AGE_DAYS:-3}
+      # Nightly/Canary-Abweichungen im Report zeigen (Default: aus).
+      SHOW_EXOTIC_PRERELEASES: ${SHOW_EXOTIC_PRERELEASES:-0}
     volumes:
       - audit-reports:/app/reports   # Report-JSON/MD + .heartbeat
       - audit-cache:/app/.cache      # Trivy-DB (nur 1× laden statt jede Nacht)
