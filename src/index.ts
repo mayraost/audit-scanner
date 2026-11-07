@@ -402,6 +402,15 @@ async function imageFreshnessTest(): Promise<number> {
     check(`replaceTag(${from} → ${to})`, got === expected, `got=${JSON.stringify(got)}`);
   }
 
+  // 8) Regression variantDriftTag (v1.6.1): der variantenlose Tag ist KEIN
+  //    Drift. Prod-Alert 2026-11-07 zeigte "variant drift: 26.13.0" für alle
+  //    node-Pins — reines Rauschen, semver-gleicher Stand ohne OS-Suffix.
+  const nodeTags = ['26.13.0', '26.13.0-alpine3.24', '26.13.0-alpine3.21', '26.12.0-alpine3.24'];
+  const bare = variantDriftTag('26.13.0-alpine3.24', nodeTags);
+  check('variantDriftTag ignoriert variantenlosen Tag', bare !== '26.13.0', `drift=${bare ?? 'null'}`);
+  const pgTags2 = ['0.8.7-pg17', '0.8.7-pg17-bookworm', '0.8.7-pg17-trixie'];
+  const pgDrift2 = variantDriftTag('0.8.7-pg17', pgTags2);  check('variantDriftTag erkennt echte OS-Drift', pgDrift2 !== null && pgDrift2 !== '0.8.7-pg17', `drift=${pgDrift2 ?? 'null'}`);
+
   process.stdout.write(ok ? './ image-freshness-test PASS\n' : '✗ image-freshness-test FAIL\n');
   return ok ? 0 : 1;
 }

@@ -968,7 +968,7 @@ export function telegramBody(
     return lines.join('\n\n');
   }
   if (withFinds.length === 0) {
-    lines.push('✅ Keine neuen high/critical-Security-Advisories gefunden.');
+    lines.push('✅ Keine neuen high/critical-Advisories in Lockfile-Dependencies (npm/pip/go).');
   }
   for (const r of withFinds) {
     const visible = r.findings.filter((f) => !isSuppressed(f));
@@ -988,22 +988,24 @@ export function telegramBody(
     lines.push(`🔇 LLM-suppressed: ${suppressedCount}/${totalCount} Funde (Details im Report „LLM-suppressed“-Sektion).`);
   }
   // 🐳 Image-Sektion: nur relevante Einträge — Update verfügbar, floating
-  // (Pin-Enforcement/„Rebuild aktualisiert") oder variantDrift (v1.5.2:
-  // semver-gleicher Tag mit anderer OS-Basis, report-only). Pinned+aktuelle
-  // Images sind raus, auch wenn sie Base-Image-Vulns haben (→ 🛡-Sektion).
-  // Repo hat offenen Image-PR → Section trotzdem zeigen (PR-Kontext).
+  // 🐳 Image-Sektion: nur ECHTE Handlungspunkte — Update verfügbar oder floating
+  // (Pin-Enforcement/„Rebuild aktualisiert"). variantDrift (v1.6.1) ist bewusst
+  // NICHT mehr drin: semver-gleicher Tag mit anderer OS-Basis ist kein Update
+  // und war reines Rauschen (Prod-Alert 2026-11-07). Steht nur im Report.
+  // Pinned+aktuelle Images sind ebenfalls raus (→ 🛡-Sektion für CVEs).
   const imgRepos = report.repos.filter(
     (r) =>
       !!r.imagePr?.prUrl ||
-      r.images?.some((i) => !i.note && (i.updateAvailable || i.floating || !!i.variantDrift))
+      r.images?.some((i) => !i.note && (i.updateAvailable || i.floating))
   );
   if (imgRepos.length > 0) {
     lines.push('🐳 Image-Scan (Dockerfile/compose):');
     for (const r of imgRepos) {
       lines.push(`*${r.name}*:`);
       for (const f of r.images!) {
-        // skip: unscannable (note) sowie pinned+aktuell ohne Update/Drift (auch mit Vulns)
-        if (f.note || (!f.updateAvailable && !f.floating && !f.variantDrift)) continue;
+        // skip: unscannable (note), pinned+aktuell und reiner variantDrift —
+        // nur echte Handlungspunkte (Update/floating) kommen in den Alert.
+        if (f.note || (!f.updateAvailable && !f.floating)) continue;
         const vc = `H${f.vulns.high}/C${f.vulns.critical}`;
         // v1.6.0 Soaking: zu junge Kandidaten werden im Alert NICHT als Aktion
         // gezeigt (nur Report) — Package-Poisoning-Schutz.
@@ -1015,8 +1017,6 @@ export function telegramBody(
         } else if (f.floating && f.exactPin) {
           const badge = f.eligibility === 'too-young' ? ` ⏳ ${f.eligibilityLabel}` : '';
           lines.push(`  • ${f.image} → pin ${f.exactPin}${badge} [${vc}]`);
-        } else if (f.variantDrift) {
-          lines.push(`  • ${f.image} [${vc}] — variant drift: ${f.variantDrift} (report-only)`);
         } else {
           lines.push(
             `  • ${f.image} [${vc}] — ${f.pinned ? 'pinned, aktuell' : 'floating (Rebuild aktualisiert)'}`

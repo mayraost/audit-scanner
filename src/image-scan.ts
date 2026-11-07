@@ -484,6 +484,9 @@ export function variantDriftTag(currentTag: string, tags: string[]): string | nu
       (c) =>
         c.sem.valid && !c.sem.prerelease && c.sem.major === cur.major &&
         c.tag !== currentTag && c.sem.variant !== cur.variant &&
+        // Der variantenlose Tag (z. B. `26.13.0`) ist KEIN Drift — das ist
+        // derselbe Stand ohne OS-Suffix, kein alternatives Base-Image.
+        c.sem.variant !== '' &&
         c.sem.comps === cur.comps && semver.eq(c.ver, curVer)
     )
     .sort((a, b) => {
