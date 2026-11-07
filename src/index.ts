@@ -1,6 +1,7 @@
 // CLI-Einstieg: audit-scanner [scan|inventory|test-telegram]
 
 import { CRON_SCHEDULE, fixPrsEnabled, log } from './config.js';
+import semver from 'semver';
 import {
   newestExactTag,
   newestSameMajorTag,
@@ -498,6 +499,17 @@ function soakingTest(): number {
   check('pinned-beta erkannt', isPinnedPrereleaseSpec('7.1.0-beta'));
   check('stable nicht als beta', isPinnedPrereleaseSpec('7.0.2') === false);
   check('floating nicht als beta', isPinnedPrereleaseSpec('^7.0.2') === false);
+  // Regression (Prod-Report 2026-11-07): prerelease-Vergleich über coerce() ist
+  // kaputt — coerce("4.0.0-beta.7") = "4.0.0", damit wäre beta.8 nie "größer".
+  {
+    const semverMod = semver;
+    const cur = semverMod.valid('4.0.0-beta.7') ?? semverMod.coerce('4.0.0-beta.7')!.version;
+    check(
+      'beta.8 > beta.7 (voller semver-Vergleich)',
+      semverMod.gt('4.0.0-beta.8', cur),
+      `cur=${cur}`
+    );
+  }
 
   // CVE-Ausnahme ist bewusst streng: nur Security-Tools, KEIN Base-Image-Patch
   check('aquasec/trivy → sofort', isSecurityToolBump('aquasec/trivy'));

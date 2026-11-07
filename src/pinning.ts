@@ -43,6 +43,8 @@ export interface PinFinding {
   manifestPath: string;
   /** warn = production dep; info = dev/optional/peer (kein CVE). */
   severity: 'info' | 'warn';
+  /** v1.6.0: Paket steht bereits auf einem Pre-Release-Kanal (Info-only). */
+  betaPin?: boolean;
   /** v1.6.0: Publish-Datum der Ziel-Version (Soaking). */
   latestPublishedAt?: string | null;
   /** v1.6.0: Soaking-Entscheidung für das Pin-Ziel. */
@@ -161,7 +163,10 @@ function betaCandidate(
   distTags: Record<string, string> | undefined
 ): string | null {
   if (!distTags) return null;
-  const cur = semver.coerce(current);
+  // WICHTIG: die VOLLE Version vergleichen, nicht coerce() — coerce() strippt
+  // den Prerelease-Teil ("4.0.0-beta.7" → "4.0.0"), wodurch 4.0.0-beta.8 nie
+  // größer wäre (Bug v1.6.0, im Prod-Report aufgefallen).
+  const cur = semver.valid(current) ?? semver.coerce(current)?.version ?? null;
   const candidates: string[] = [];
   for (const [tag, version] of Object.entries(distTags)) {
     if (!semver.valid(version)) continue;
@@ -169,9 +174,8 @@ function betaCandidate(
     const cls = classifyPrerelease(version);
     if (cls.cls === 'exotic' && !showExoticPrereleases()) continue;
     if (!channelCompatible(current, version)) continue;
-    const v = semver.coerce(version);
-    if (cur && v && !semver.gt(v, cur)) continue;
-    // `next`/`dev`-dist-tags sind oft Build-Snapshots; nur bei explicitem Opt-in
+    if (cur && !semver.gt(version, cur)) continue;
+    // `next`/`dev`-dist-tags sind oft Build-Snapshots; nur bei explizitem Opt-in
     if (cls.cls === 'exotic' && !/^(next|dev|insiders|canary|nightly)$/i.test(tag)) continue;
     candidates.push(version);
   }
@@ -208,12 +212,11 @@ export async function collectPinning(repo: RepoInfo, repoDir: string): Promise<P
         const finding: PinFinding = {
           pkg,
           current: typeof spec === 'string' ? spec.trim() : String(spec),
-          // betaPinned: kein "latest exact"-Ziel (stable != Beta-Kanal), sondern
-          // der Kanal-Nachbar aus prereleaseHint.
-          latest: floating ? latest : null,
+          latest,
           section,
           manifestPath: rel,
           severity: section === 'dependencies' ? 'warn' : 'info',
+          betaPin: betaPinned,
         };
         // Soaking (v1.6.0): Alter des Ziel-Kandidaten bestimmen. latest ist kein
         // CVE-Fix (kein Advisory-Bezug im Pinning-Pfad) → nur die 3-Tage-Regen.
@@ -253,7 +256,9 @@ export async function collectPinning(repo: RepoInfo, repoDir: string): Promise<P
 
   const fixable = findings.filter((f) => {
     if (!PR_SECTIONS.includes(f.section)) return false; // optional/peer = report-only
-    if (!f.latest) return false; // deckt auch betaPinned (latest=null) ab
+    if (!f.latest) return false;
+    // Beta-Pins sind Info-only: das Paket soll bewusst im Beta-Kanal bleiben.
+    if (f.betaPin) return false;
     // Soaking (v1.6.0): nur reife Ziel-Versionen werden gepinnt. Zu junge
     // Kandidaten bleiben im Report ("zu jung (2d)") und warten auf den nächsten Lauf.
     if (f.eligibility === 'too-young') return false;
