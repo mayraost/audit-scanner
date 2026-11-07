@@ -96,6 +96,11 @@ COMMANDS
                 404). v1.7.1: Registry-Präfix ≠ Git-Präfix (trivy v0.76.2 vs
                 Docker-Hub 0.76.2) → beide Kandidaten geprüft. Fake-Releases/
                 -Manifeste, kein Netzwerk.
+  pinning-test  Pins-PR-Qualität (v1.7.2) OFFLINE mit Fake-Registry/GitHub/
+                Lockfile-Regen: Peer-Konflikt → Ausweichversion oder kein Pin,
+                Regen-Fehler → kein Manifest-Commit im PR (fail-closed, Draft +
+                ⚠️), kein [skip ci] in Commit-Messages, Image-Tag-Präfix-Flip
+                (Docker Hub/MCR/Quay). Kein Netz, kein PR, kein Telegram.
 
 ENV
   GH_TOKEN            Pflicht (Bearer für api.github.com). Dev-Fallback lokal:
@@ -186,6 +191,13 @@ async function main(): Promise<void> {
       // Purer Selbsttest des Digest-Caches (v1.6.2): Fake-Datei in tmp,
       // fixe Fake-Uhr, kein Netzwerk, kein Scan.
       process.exitCode = digestTest();
+      return;
+    }
+    case 'pinning-test': {
+      // Pins-PR-Qualität (v1.7.2): Fake-Registry/GitHub/Regen injiziert,
+      // kein Netzwerk, kein PR, kein Telegram.
+      const { pinningTest } = await import('./pinning-test.js');
+      process.exitCode = await pinningTest();
       return;
     }
     case 'release-version-test': {

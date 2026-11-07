@@ -162,13 +162,23 @@ export interface ReleaseCheckDeps {
 export function registryTagCandidates(releaseTag: string): string[] {
   const tag = releaseTag.trim();
   if (!tag) return [];
-  const flipped = /^v\d/i.test(tag) ? tag.slice(1) : /^\d/.test(tag) ? `v${tag}` : null;
-  return flipped ? [tag, flipped] : [tag];
+  // Nur reine Versions-Tags `x.y[.z]` (optional `v`) flippen. Build-Meta-/
+  // Datums-Tags wie `2026.11.1-9ded3bec1` oder `main-20261101`: dort ist der
+  // Flip bedeutungslos (kein Registry-Tag heißt so) → verbatim, kein Rauschen.
+  const m = /^(v?)(\d+(?:\.\d+){1,2})$/.exec(tag);
+  if (!m) return [tag];
+  const [, v] = m;
+  const flipped = v ? tag.slice(1) : `v${tag}`;
+  return [tag, flipped];
 }
 
 /** Registry-Label für Klartext-Notes. */
 function registryLabel(registry: ReleaseRegistry): string {
-  return registry === 'docker-hub' ? 'Docker Hub' : registry === 'ghcr' ? 'GHCR' : registry === 'mcr' ? 'MCR' : 'Registry';
+  if (registry === 'docker-hub') return 'Docker Hub';
+  if (registry === 'ghcr') return 'GHCR';
+  if (registry === 'mcr') return 'MCR';
+  if (registry === 'quay') return 'Quay';
+  return 'Registry';
 }
 
 async function defaultFetchReleases(repo: string): Promise<GhRelease[]> {
@@ -194,29 +204,54 @@ async function defaultManifestExists(
 }
 
 /**
- * Registry-Probe über ALLE sinnvollen Tag-Kandidaten (v1.7.1).
- *
- * - `exists: true` → erster Kandidat, der ein Manifest hat (`matchedTag`).
- * - `exists: false` → ALLE Kandidaten waren belastbar 404. Nur dann darf der
- *   Report "kein Image" behaupten.
- * - `exists: null` → mindestens ein Kandidat war nicht belastbar (Netz-/Auth-
- *   Fehler) und keiner hat getroffen → unbekannt, keine falsche Aussage.
+ * Ergebnis einer Registry-Probe als EXPLIZITE Statusform (v1.7.2) — das ist die
+ * eine Stelle, an der "kein Image publiziert" entstehen darf. `absent` ist nur
+ * erlaubt, wenn JEDER geprüfte Kandidat belastbar 404 war; sobald eine Probe
+ * unbelastbar ist (Netz-/5xx/Auth), lautet das Ergebnis `unknown` und der Report
+ * behauptet nichts. `tried`/`unknown` machen den Beleg im Note-Text nachvollziehbar.
  */
-async function probeRegistryTag(
+export interface ManifestProbe {
+  status: 'present' | 'absent' | 'unknown';
+  /** Geprüfte Tag-Kandidaten in Reihenfolge (verbatim, dann Präfix-Flip). */
+  tried: string[];
+  /** Kandidaten mit unbelastbarer Antwort (nur bei status 'unknown'). */
+  unknown?: string[];
+  /** Kandidat, der getroffen hat (nur bei status 'present', wenn ≠ verbatim). */
+  matched?: string;
+}
+
+/**
+ * Probe-Status auf die Report-Aussage abbilden. Einziger Konsument der
+ * "kein Image"-Behauptung — reine Funktion, offline testbar.
+ */
+export function isBelievable(probe: ManifestProbe): 'present' | 'absent' | 'unknown' {
+  if (probe.status === 'present') return 'present';
+  if (probe.status === 'absent' && (probe.unknown?.length ?? 0) === 0) return 'absent';
+  return 'unknown';
+}
+
+/** Manifest-Existenz für alle Tag-Kandidaten proben → ManifestProbe. */
+export async function probeRegistryTag(
   manifestExists: (base: string, tag: string, registry: ReleaseRegistry) => Promise<boolean | null>,
   base: string,
   releaseTag: string,
   registry: ReleaseRegistry
-): Promise<{ exists: boolean | null; matchedTag?: string }> {
+): Promise<ManifestProbe> {
   const candidates = registryTagCandidates(releaseTag);
-  if (candidates.length === 0) return { exists: null };
-  let unknown = false;
+  if (candidates.length === 0) return { status: 'unknown', tried: [] };
+  const unknown: string[] = [];
   for (const tag of candidates) {
     const res = await manifestExists(base, tag, registry);
-    if (res === true) return { exists: true, matchedTag: tag };
-    if (res === null) unknown = true;
+    if (res === true) {
+      const out: ManifestProbe = { status: 'present', tried: candidates };
+      if (tag !== releaseTag.trim()) out.matched = tag;
+      return out;
+    }
+    if (res === null) unknown.push(tag);
   }
-  return { exists: unknown ? null : false };
+  return unknown.length > 0
+    ? { status: 'unknown', tried: candidates, unknown }
+    : { status: 'absent', tried: candidates };
 }
 
 /**
@@ -288,25 +323,26 @@ export async function upstreamReleaseCheck(
             latestRelease,
             opts.registry
           );
-          if (probe.exists === true) {
+          const verdict = isBelievable(probe);
+          if (verdict === 'present') {
             out = { latestRelease, newerThanTag: true };
-            if (probe.matchedTag && probe.matchedTag !== latestRelease.trim()) {
+            if (probe.matched) {
               // Präfix-Flip hat gegriffen: den echten Registry-Tag nennen, damit
               // der Mensch den passenden Pin direkt sieht.
-              out.note = `${latestRelease} released → Registry-Tag ${probe.matchedTag}`;
+              out.note = `${latestRelease} released → Registry-Tag ${probe.matched}`;
             }
-          } else if (probe.exists === false) {
+          } else if (verdict === 'absent') {
             out = {
               latestRelease,
               newerThanTag: true,
               releaseWithoutImage: true,
-              note: `${latestRelease} released, aber kein Image auf ${label} (404; geprüft: ${registryTagCandidates(latestRelease).join(', ')})`,
+              note: `${latestRelease} released, aber kein Image auf ${label} (404; geprüft: ${probe.tried.join(', ')})`,
             };
           } else {
             out = {
               latestRelease,
               newerThanTag: true,
-              note: `${latestRelease} released, Image-Status auf ${label} unbekannt`,
+              note: `${latestRelease} released, Image-Status auf ${label} unbekannt (Probe unbelastbar: ${(probe.unknown ?? probe.tried).join(', ')})`,
             };
           }
         }
