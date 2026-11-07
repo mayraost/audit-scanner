@@ -17,6 +17,7 @@ import {
 import { channelCompatible, classifyPrerelease } from './prerelease.js';
 import {
   latestStableRelease,
+  registryTagCandidates,
   releaseIsNewer,
   upstreamReleaseCheck,
   upstreamRepoFor,
@@ -92,7 +93,9 @@ COMMANDS
                 Tag), 90-Tage-Prune. Fake-Datei in tmp, kein Netzwerk.
   release-version-test  Upstream-Release-Check (v1.6.3): Registry-Tags sind nicht
                 die Release-Wahrheit (playwright-mcp v0.0.84 released, MCR-Tag
-                404). Fake-Releases/-Manifeste, kein Netzwerk.
+                404). v1.7.1: Registry-Präfix ≠ Git-Präfix (trivy v0.76.2 vs
+                Docker-Hub 0.76.2) → beide Kandidaten geprüft. Fake-Releases/
+                -Manifeste, kein Netzwerk.
 
 ENV
   GH_TOKEN            Pflicht (Bearer für api.github.com). Dev-Fallback lokal:
@@ -788,7 +791,7 @@ async function releaseVersionTest(): Promise<number> {
   check('(a) Manifest vorhanden → KEINE "kein Image"-Note', pw.releaseWithoutImage !== true && !/kein Image/.test(pw.note ?? ''));
 
   // (b) Release da, Tag fehlt auf der Registry (404 simuliert)
-  let headChecked = '';
+  const headChecked: string[] = [];
   const missing = await upstreamReleaseCheck(
     { base: 'playwright/mcp', currentTag: 'v0.0.83-mcr', registry: 'mcr' },
     {
@@ -797,7 +800,7 @@ async function releaseVersionTest(): Promise<number> {
       // anderer current-Tag als (a): der Prozess-Cache ist je Ref gekeyt.
       fetchReleases: async () => releasesFor(['v0.0.84']),
       manifestExists: async (base, tag, registry) => {
-        headChecked = `${base}:${tag}@${registry}`;
+        headChecked.push(`${base}:${tag}@${registry}`);
         return false;
       },
     }
@@ -805,7 +808,9 @@ async function releaseVersionTest(): Promise<number> {
   check('(b) Tag fehlt (404) → note enthält "kein Image"', /kein Image/.test(missing.note ?? ''), missing.note ?? '—');
   check('(b) note nennt Registry-Label + 404', /MCR/.test(missing.note ?? '') && /404/.test(missing.note ?? ''));
   check('(b) releaseWithoutImage = true', missing.releaseWithoutImage === true);
-  check('(b) Manifest-Check für Release-Tag auf der Registry', headChecked === 'playwright/mcp:v0.0.84@mcr', headChecked);
+  // v1.7.1: verbatim zuerst, dann Präfix-Flip — "kein Image" erst nach beiden 404.
+  check('(b) Manifest-Check verbatim + Präfix-Flip',
+    headChecked.join('|') === 'playwright/mcp:v0.0.84@mcr|playwright/mcp:0.0.84@mcr', headChecked.join('|'));
 
   // (c) Docker-Official-Image: kein Upstream-Repo, kein Fehler, kein Netzwerk
   let fetchCalled = false;
@@ -891,6 +896,46 @@ async function releaseVersionTest(): Promise<number> {
   check('(g) upstreamNewerOnly erkennt Release-ohne-Image', upstreamNewerOnly({ ...baseFinding, upstreamLatest: 'v0.0.84' }));
   check('(g) ohne Release → KEIN upstream-Only', !upstreamNewerOnly({ ...baseFinding, upstreamLatest: null }));
   check('(g) mit Update → upstream-Only false', !upstreamNewerOnly({ ...baseFinding, upstreamLatest: 'v0.0.84', updateAvailable: true }));
+
+  // (h) v1.7.1: Registry-Tag-Präfix ≠ Git-Release-Tag-Präfix.
+  // Beleg 2026-11-07: aquasec/trivy (Docker Hub: 0.76.2) vs Git-Tag v0.76.2.
+  check('(h) candidates v0.76.2 → [v0.76.2, 0.76.2]', registryTagCandidates('v0.76.2').join('|') === 'v0.76.2|0.76.2');
+  check('(h) candidates 0.76.2 → [0.76.2, v0.76.2]', registryTagCandidates('0.76.2').join('|') === '0.76.2|v0.76.2');
+  check('(h) candidates ohne Präfix-Nummer → nur verbatim', registryTagCandidates('main-20261101').join('|') === 'main-20261101');
+  const trivyFixed = await upstreamReleaseCheck(
+    { base: 'demo/trivy-lookalike', currentTag: '0.76.1', registry: 'docker-hub' },
+    {
+      fetchReleases: async () => releasesFor(['v0.76.2', 'v0.76.1']),
+      // Docker-Hub-Variante: nur der Tag OHNE v existiert → verbatim (v0.76.2) 404.
+      manifestExists: async (_b, tag) => tag === '0.76.2',
+    }
+  );
+  check('(h) trivy-Fall: v-Release, ungeprefixter Registry-Tag → Image vorhanden',
+    trivyFixed.newerThanTag === true && trivyFixed.releaseWithoutImage !== true && /Registry-Tag 0\.76\.2/.test(trivyFixed.note ?? ''),
+    trivyFixed.note ?? '—');
+  const mcrStillMissing = await upstreamReleaseCheck(
+    { base: 'playwright/mcp', currentTag: 'v0.0.82-x', registry: 'mcr' },
+    {
+      // Cache-Key-Trennung über den current-Tag; Logik identisch zu (b).
+      fetchReleases: async () => releasesFor(['v0.0.84']),
+      // MCR-Variante: weder v0.0.84 noch 0.0.84 existieren → echt kein Image.
+      manifestExists: async () => false,
+    }
+  );
+  check('(h) playwright-Fall: BEIDE Kandidaten 404 → weiterhin "kein Image"',
+    mcrStillMissing.releaseWithoutImage === true && /geprüft: v0\.0\.84, 0\.0\.84/.test(mcrStillMissing.note ?? ''),
+    mcrStillMissing.note ?? '—');
+  const unknownProbe = await upstreamReleaseCheck(
+    { base: 'demo/unknown-probe', currentTag: '1.0.0', registry: 'ghcr' },
+    {
+      fetchReleases: async () => releasesFor(['v1.1.0']),
+      // Ein Kandidat 404, der andere unbelastbar (null) → KEINE "kein Image"-Aussage.
+      manifestExists: async (_b, tag) => (tag === 'v1.1.0' ? false : null),
+    }
+  );
+  check('(h) unbelastbare Probe (null) → keine falsche "kein Image"-Behauptung',
+    unknownProbe.releaseWithoutImage !== true && /unbekannt/.test(unknownProbe.note ?? ''),
+    unknownProbe.note ?? '—');
 
   process.stdout.write(ok ? './ release-version-test PASS\n' : '✗ release-version-test FAIL\n');
   return ok ? 0 : 1;
