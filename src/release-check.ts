@@ -12,6 +12,14 @@
 // Upstream-Projekts ab und prüft per Manifest-HEAD, ob der Release-Tag auf der
 // Registry überhaupt publiziert wurde.
 //
+// v1.7.1 (belegt 2026-11-07): Registry-Tags tragen ihre EIGENE Präfix-Konvention.
+// `aquasecurity/trivy` released `v0.76.2`, Docker Hub taggt `aquasec/trivy` aber
+// als `0.76.2` — der verbatim übergebene Release-Tag 404-te und der Report
+// behauptete fälschlich "kein Image publiziert". MCR `playwright/mcp` taggt
+// dagegen MIT `v` — dort passte es nur zufällig. Der Manifest-Lookup probiert
+// deshalb beide Varianten (registryTagCandidates) und behauptet "kein Image"
+// erst, wenn ALLE belastbar 404 sind.
+//
 // Alles reine HTTP-Calls (GitHub über ghJson, Manifest über publish-dates);
 // kein Docker-Daemon. Fehler werfen NIE: `latestRelease: null` + `note`.
 
@@ -136,6 +144,28 @@ export interface ReleaseCheckDeps {
   manifestExists?: (base: string, tag: string, registry: ReleaseRegistry) => Promise<boolean | null>;
 }
 
+/**
+ * Registry-Tag-Kandidaten für einen GitHub-Release-Tag (v1.7.1, belegt 2026-11-07).
+ *
+ * **Registry-Tags tragen ihre EIGENE Präfix-Konvention — nicht die des Git-Tags.**
+ * Der Check übergab den Release-Tag bisher verbatim an den Manifest-Lookup:
+ * `aquasecurity/trivy` released `v0.76.2`, aber Docker Hub taggt `aquasec/trivy`
+ * als `0.76.2` → `manifests/v0.76.2` = 404 → Report fälschlich
+ * "kein Image publiziert", obwohl das Image existiert. Umgekehrt taggt MCR
+ * `playwright/mcp` als `v0.0.83` (dort passte es zufällig).
+ *
+ * Reihenfolge: (1) Tag verbatim, (2) Präfix-Flip (`v0.76.2` → `0.76.2`,
+ * `0.76.2` → `v0.76.2`). Beide Kandidaten werden geprüft, BEVOR "kein Image"
+ * behauptet wird — sonst entsteht der False-Positive erneut in Gegenrichtung.
+ * Leere/Einzel-`v`-Tags liefern nur den Original-Kandidaten.
+ */
+export function registryTagCandidates(releaseTag: string): string[] {
+  const tag = releaseTag.trim();
+  if (!tag) return [];
+  const flipped = /^v\d/i.test(tag) ? tag.slice(1) : /^\d/.test(tag) ? `v${tag}` : null;
+  return flipped ? [tag, flipped] : [tag];
+}
+
 /** Registry-Label für Klartext-Notes. */
 function registryLabel(registry: ReleaseRegistry): string {
   return registry === 'docker-hub' ? 'Docker Hub' : registry === 'ghcr' ? 'GHCR' : registry === 'mcr' ? 'MCR' : 'Registry';
@@ -161,6 +191,32 @@ async function defaultManifestExists(
   const note = d.note ?? '';
   if (/404|Manifest unbekannt/.test(note)) return false;
   return null;
+}
+
+/**
+ * Registry-Probe über ALLE sinnvollen Tag-Kandidaten (v1.7.1).
+ *
+ * - `exists: true` → erster Kandidat, der ein Manifest hat (`matchedTag`).
+ * - `exists: false` → ALLE Kandidaten waren belastbar 404. Nur dann darf der
+ *   Report "kein Image" behaupten.
+ * - `exists: null` → mindestens ein Kandidat war nicht belastbar (Netz-/Auth-
+ *   Fehler) und keiner hat getroffen → unbekannt, keine falsche Aussage.
+ */
+async function probeRegistryTag(
+  manifestExists: (base: string, tag: string, registry: ReleaseRegistry) => Promise<boolean | null>,
+  base: string,
+  releaseTag: string,
+  registry: ReleaseRegistry
+): Promise<{ exists: boolean | null; matchedTag?: string }> {
+  const candidates = registryTagCandidates(releaseTag);
+  if (candidates.length === 0) return { exists: null };
+  let unknown = false;
+  for (const tag of candidates) {
+    const res = await manifestExists(base, tag, registry);
+    if (res === true) return { exists: true, matchedTag: tag };
+    if (res === null) unknown = true;
+  }
+  return { exists: unknown ? null : false };
 }
 
 /**
@@ -226,19 +282,25 @@ export async function upstreamReleaseCheck(
             note: `${latestRelease} released (${repo}) — Registry ohne Manifest-Check`,
           };
         } else {
-          const exists = await (deps.manifestExists ?? defaultManifestExists)(
+          const probe = await probeRegistryTag(
+            deps.manifestExists ?? defaultManifestExists,
             opts.base,
             latestRelease,
             opts.registry
           );
-          if (exists === true) {
+          if (probe.exists === true) {
             out = { latestRelease, newerThanTag: true };
-          } else if (exists === false) {
+            if (probe.matchedTag && probe.matchedTag !== latestRelease.trim()) {
+              // Präfix-Flip hat gegriffen: den echten Registry-Tag nennen, damit
+              // der Mensch den passenden Pin direkt sieht.
+              out.note = `${latestRelease} released → Registry-Tag ${probe.matchedTag}`;
+            }
+          } else if (probe.exists === false) {
             out = {
               latestRelease,
               newerThanTag: true,
               releaseWithoutImage: true,
-              note: `${latestRelease} released, aber kein Image auf ${label} (404)`,
+              note: `${latestRelease} released, aber kein Image auf ${label} (404; geprüft: ${registryTagCandidates(latestRelease).join(', ')})`,
             };
           } else {
             out = {
