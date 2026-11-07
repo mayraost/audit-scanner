@@ -23,6 +23,8 @@ import type { RepoInfo } from './inventory.js';
 import { regenerateLockfile, putContent, type FixResult } from './fix-pr.js';
 import { channelCompatible, classifyPrerelease, showExoticPrereleases } from './prerelease.js';
 import { npmVersionPublishedAt } from './publish-dates.js';
+import type { RenovateCandidate } from './renovate.js';
+import { collectRenovateCandidates, renovateEnabled } from './renovate.js';
 import { updateEligibility, type Eligibility } from './soaking.js';
 import { upsertEntry, type State } from './state.js';
 
@@ -43,6 +45,14 @@ export interface PinFinding {
   manifestPath: string;
   /** warn = production dep; info = dev/optional/peer (kein CVE). */
   severity: 'info' | 'warn';
+  /** v1.7.0: woher der Vorschlag stammt (floating-Pin oder Renovate-Analyse). */
+  source?: 'pinning' | 'renovate';
+  /** v1.7.0: Renovate-updateType (major/minor/patch/pin/digest). */
+  updateType?: string;
+  /** v1.7.0: Alter der Zielversion in Tagen (Renovate releaseTimestamp). */
+  releaseAgeDays?: number | null;
+  /** v1.7.0: Major-/Breaking-Update → nur Report, nie PR. */
+  majorOrBreaking?: boolean;
   /** v1.6.0: Paket steht bereits auf einem Pre-Release-Kanal (Info-only). */
   betaPin?: boolean;
   /** v1.6.0: Publish-Datum der Ziel-Version (Soaking). */
@@ -188,6 +198,50 @@ function betaCandidate(
  * deps sammeln, je pkg latest bestimmen. Der Pr-RepoDir-Checkout ist bereits
  * entpackt (scan.ts ruft das nach downloadTarball).
  */
+/**
+ * Renovate-Kandidaten (v1.7.0) in PinFinding überführen.
+ *
+ * Arbeitsteilung: der Pinning-Scanner findet FLOATING Specs (`^1.2.3`),
+ * Renovate ergänzt EXAKT gepinnte deps, für die es eine neuere Version gibt —
+ * die sieht der Pinning-Scanner per Definition nicht. Soaking ist bereits
+ * Renovates Sache (`minimumReleaseAge`), hier wird NICHT erneut gefiltert.
+ *
+ * Guards: Major/Breaking → nur Report, nie PR (Owner-Regel "Major-Sprünge nur
+ * bewusst"). Major-Sprünge müssen von Hand entschieden werden.
+ */
+export function renovateToPinFindings(
+  repoDir: string,
+  candidates: RenovateCandidate[],
+  findings: PinFinding[]
+): PinFinding[] {
+  const out: PinFinding[] = [];
+  const seen = new Set(findings.map((f) => `${f.manifestPath}|${f.pkg}`));
+  for (const c of candidates) {
+    const rel = path.posix.join(...path.relative(repoDir, path.join(repoDir, c.packageFile)).split(path.sep));
+    const key = `${rel}|${c.depName}`;
+    if (seen.has(key)) continue; // schon als floating Pin erfasst → keine Doppelmeldung
+    seen.add(key);
+    const section: PinSection = c.depType === 'devDependencies' ? 'devDependencies' : 'dependencies';
+    out.push({
+      pkg: c.depName,
+      current: c.currentValue,
+      latest: c.newVersion,
+      section,
+      manifestPath: rel,
+      severity: section === 'dependencies' ? 'warn' : 'info',
+      source: 'renovate',
+      updateType: c.updateType,
+      releaseAgeDays: c.ageDays,
+      // Soaking lief bereits in Renovate → als reif behandelt.
+      eligibility: 'eligible',
+      eligibilityLabel: c.ageDays === null ? 'reif (Renovate)' : `reif (${c.ageDays}d)`,
+      ageDays: c.ageDays,
+      // Major/Breaking bleiben report-only (kein PR).
+      majorOrBreaking: c.updateType === 'major' || c.isBreaking === true,
+    });
+  }
+  return out;
+}
 export async function collectPinning(repo: RepoInfo, repoDir: string): Promise<PinScanResult> {
   const findings: PinFinding[] = [];
   const files = findPackageJsonFiles(repoDir);
@@ -254,9 +308,23 @@ export async function collectPinning(repo: RepoInfo, repoDir: string): Promise<P
     }
   }
 
+  // Renovate-Analyse (v1.7.0): ergänzt EXAKT gepinnte deps, die der Floating-
+  // Scanner prinzipiell nicht sieht. Renovate erzeugt NIE eigene PRs — die
+  // Vorschläge landen im gemeinsamen Pins-PR. Nicht verfügbar → silent skip.
+  if (renovateEnabled()) {
+    const ren = await collectRenovateCandidates(repoDir);
+    if (ren.ok) {
+      findings.push(...renovateToPinFindings(repoDir, ren.candidates, findings));
+    } else if (ren.note) {
+      log(`Renovate ${repo.name}: ${ren.note}`);
+    }
+  }
+
   const fixable = findings.filter((f) => {
     if (!PR_SECTIONS.includes(f.section)) return false; // optional/peer = report-only
     if (!f.latest) return false;
+    // Renovate-Major-/Breaking-Updates: nur Report, nie PR (Owner-Regel).
+    if (f.majorOrBreaking) return false;
     // Beta-Pins sind Info-only: das Paket soll bewusst im Beta-Kanal bleiben.
     if (f.betaPin) return false;
     // Soaking (v1.6.0): nur reife Ziel-Versionen werden gepinnt. Zu junge
@@ -284,9 +352,85 @@ export function pinsBranchName(date = new Date()): string {
 /**
  * Pins-PR (immer-PR-Policy, deterministisch OHNE LLM): alle fixable floating
  * deps eines Repos in EINEM PR, alle package.json-Manifests in EINER Branch.
- * Lockfile-Regen nur wenn Lockfile im SELBEN Verzeichnis wie das Manifest liegt
- * (monorepo root package-lock := dir ''; nested manifests → manual regen Note).
+ * Lockfile-Regen über das ABDECKENDE Lockfile (eigenes Verzeichnis oder
+ * Workspace-Root bei Monorepos) — siehe findCoveringLockfile; ohne Lockfile
+ * wird der Kandidat fail-closed ausgelassen (v1.7.0).
  */
+/** Vom Regen berücksichtigte Lockfile-Variante + abgedecktes Manifest. */
+export interface LockTarget {
+  eco: 'npm' | 'pnpm' | 'yarn';
+  /** Repo-relativer Pfad des Lockfiles (z. B. `package-lock.json`). */
+  path: string;
+  sha: string;
+  content: string;
+  /**
+   * Weitere Manifeste im selben Regen-Topf (npm `workspaces`): der Regen läuft
+   * in einem tmp-Dir mit dem ROOT-`package.json`; damit npm die geänderten
+   * Nested-Manifeste einbezieht, werden sie zusätzlich hineingelegt.
+   */
+  pkgJsonOverrides?: Record<string, string>;
+}
+
+/**
+ * Lockfile bestimmen, das ein Manifest abdeckt (v1.7.0, Owner-Anforderung).
+ *
+ * Reihenfolge:
+ * 1. Verzeichnis des Manifests selbst (`apps/web/package.json` →
+ *    `apps/web/package-lock.json`) — eigenständiges Projekt.
+ * 2. Aufwärts bis Repo-Root: das erste gefundene Lockfile. Ein npm-Root-
+ *    `package-lock.json` mit `workspaces` deckt alle Nested-Manifeste ab;
+ *    `pnpm-lock.yaml` an der Workspace-Wurzel ebenso.
+ *
+ * `null` = kein abdeckendes Lockfile → Aufrufer muss fail-closed abbrechen.
+ */
+export async function findCoveringLockfile(
+  repo: string,
+  branch: string,
+  manifestPath: string
+): Promise<LockTarget | null> {
+  const LOCK_NAMES: Array<{ name: string; eco: 'npm' | 'pnpm' | 'yarn' }> = [
+    { name: 'package-lock.json', eco: 'npm' },
+    { name: 'pnpm-lock.yaml', eco: 'pnpm' },
+    { name: 'yarn.lock', eco: 'yarn' },
+  ];
+  // Kandidaten-Verzeichnisse: Manifest-Dir, dann jede Ebene bis zum Root.
+  const dirs: string[] = [];
+  let dir = path.posix.dirname(manifestPath);
+  dirs.push(dir === '.' ? '' : dir);
+  while (dirs[dirs.length - 1] !== '' && dirs.length < 12) {
+    const parent = path.posix.dirname(dirs[dirs.length - 1]!);
+    dirs.push(parent === '.' ? '' : parent);
+  }
+
+  for (const d of dirs) {
+    for (const lock of LOCK_NAMES) {
+      const lockPath = d ? `${d}/${lock.name}` : lock.name;
+      const file = await ghJsonOrNull<{ sha: string; content: string }>(
+        `/repos/${OWNER}/${repo}/contents/${lockPath}?ref=${encodeURIComponent(branch)}`
+      );
+      if (!file) continue;
+      // yarn.lock-Regen ist nicht automatisiert (siehe fix-pr.ts) → nicht
+      // als "abdeckend" melden, sonst entstünde wieder ein PR ohne Lockfile.
+      if (lock.eco === 'yarn') {
+        log(`Pins-PR ${repo}: ${lockPath} gefunden, yarn-Regen nicht automatisiert — übersprungen.`);
+        continue;
+      }
+      // Nested-Manifest: Root-Lockfile deckt nur ab, wenn es Workspaces nutzt.
+      if (d === '' && manifestPath.includes('/')) {
+        const rootPkg = await ghJsonOrNull<{ sha: string; content: string }>(
+          `/repos/${OWNER}/${repo}/contents/package.json?ref=${encodeURIComponent(branch)}`
+        );
+        const ws = rootPkg
+          ? (JSON.parse(decodeB64(rootPkg.content)) as { workspaces?: unknown }).workspaces
+          : undefined;
+        if (!ws) continue; // Root-Lockfile ohne workspaces deckt Nested-Manifest nicht ab
+      }
+      return { eco: lock.eco, path: lockPath, sha: file.sha, content: decodeB64(file.content) };
+    }
+  }
+  return null;
+}
+
 export async function createPinsPr(
   repo: RepoInfo,
   findings: PinFinding[],
@@ -357,33 +501,40 @@ export async function createPinsPr(
       changed = true;
       bumped.push(...fileBumped);
 
-      // Lockfile im selben Manifestverzeichnis (dir '' = Repo-Root) regenerieren.
-      const lockDir = path.posix.dirname(manifestPath) === '.' ? '' : path.posix.dirname(manifestPath);
-      let lockNote: string | null = null;
-      if (lockDir !== '') {
-        lockNote = 'nested manifest — Lockfile-Regen nicht automatisiert (root-Lockfile)';
+      // Lockfile-Regeneration (v1.7.0): das Manifest kann im Repo-Root liegen
+      // ODER in einem Unterverzeichnis (Monorepo). Zuständig ist das Lockfile,
+      // das das Manifest abdeckt: bei npm das Root-`package-lock.json` mit
+      // `workspaces`, sonst das nächste Lockfile im eigenen Verzeichnis.
+      // Findet sich keines, fliegt der Kandidat fail-closed aus dem PR —
+      // ein PR ohne passendes Lockfile bricht `npm ci` und ist wertlos.
+      const lockNote: string | null = null;
+      const lockTarget = await findCoveringLockfile(repo.name, branch, manifestPath);
+      if (!lockTarget) {
+        notes.push(`${manifestPath}: kein abdeckendes Lockfile gefunden — Pin nicht angewandt (fail-closed)`);
+        continue;
+      }
+      const regen = await regenerateLockfile(
+        lockTarget.eco,
+        updatedPkg,
+        lockTarget.content,
+        lockTarget.pkgJsonOverrides
+      );
+      if (regen.changed && regen.content !== undefined) {
+        await putContent(
+          repo.name,
+          lockTarget.path,
+          branch,
+          lockTarget.sha,
+          regen.content,
+          `chore(cve-audit): regen ${lockTarget.path} (exact pins) [skip ci]`
+        );
       } else {
-        for (const eco of ['npm', 'pnpm', 'yarn'] as const) {
-          const lockPath = eco === 'npm' ? 'package-lock.json' : eco === 'pnpm' ? 'pnpm-lock.yaml' : 'yarn.lock';
-          const lockFile = await ghJsonOrNull<{ sha: string; content: string }>(
-            `/repos/${OWNER}/${repo.name}/contents/${lockPath}?ref=${encodeURIComponent(branch)}`
-          );
-          if (!lockFile) continue;
-          const regen = await regenerateLockfile(eco, updatedPkg, decodeB64(lockFile.content));
-          if (regen.changed && regen.content !== undefined) {
-            await putContent(
-              repo.name,
-              lockPath,
-              branch,
-              lockFile.sha,
-              regen.content,
-              `chore(cve-audit): regen ${lockPath} (exact pins) [skip ci]`
-            );
-          } else if (regen.note) {
-            lockNote = regen.note;
-          }
-          break; // nur das existierende (erste) Lockfile berücksichtigen
-        }
+        // Fail-closed: ohne erfolgreichen Regen darf der Pin nicht in den PR.
+        notes.push(
+          `${manifestPath}: Lockfile-Regen von ${lockTarget.path} fehlgeschlagen` +
+            `${regen.note ? ` (${regen.note})` : ''} — Pin nicht angewandt`
+        );
+        continue;
       }
       if (lockNote) notes.push(`${manifestPath}: ${lockNote}`);
     }

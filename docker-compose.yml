@@ -23,6 +23,10 @@ services:
       UPDATE_MIN_AGE_DAYS: ${UPDATE_MIN_AGE_DAYS:-3}
       # Nightly/Canary-Abweichungen im Report zeigen (Default: aus).
       SHOW_EXOTIC_PRERELEASES: ${SHOW_EXOTIC_PRERELEASES:-0}
+      # Renovate-Analyse (v1.7.0): 0 = aus. Renovate legt NIE eigene PRs an –
+      # seine Update-Vorschläge landen im gebündelten cve-audit/pins-<datum>-PR.
+      ENABLE_RENOVATE: ${ENABLE_RENOVATE:-0}
+      RENOVATE_BIN: ${RENOVATE_BIN:-renovate}
     volumes:
       - audit-reports:/app/reports   # Report-JSON/MD + .heartbeat
       - audit-cache:/app/.cache      # Trivy-DB (nur 1× laden statt jede Nacht)

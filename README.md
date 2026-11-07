@@ -327,6 +327,38 @@ Telegram: `ℹ️ Beta/RC-Updates (Paket bereits im Beta-Kanal)` — nur für Ka
 mit Soaking-Reife. Zu junge Updates erscheinen im Alert als
 `⏳ zu jung (2d) (Report)`, also ohne Handlungsaufforderung.
 
+## 🤖 Renovate als Analyse-Quelle (seit v1.7.0)
+
+Renovate läuft optional als **zweite Meinung** und schließt eine Lücke des
+Pinning-Scanners: der findet nur *floating* Specs (`^1.2.3`). Exakt gepinnte
+Pakete, für die es eine neuere Version gibt, sieht er per Definition nicht —
+Renovate schon.
+
+**Arbeitsteilung (bewusst so):**
+
+| | Renovate | Scanner |
+|---|---|---|
+| Updates finden | ✅ `--dry-run=lookup` | ✅ floating Specs |
+| Soaking (3 Tage) | ✅ `minimumReleaseAge` aus `UPDATE_MIN_AGE_DAYS` | ✅ eigene Logik |
+| PR anlegen | ❌ **nie** (`prCreation: never`) | ✅ **allein** |
+| Bündelung | — | ✅ ein PR je Repo/Tag |
+
+Es gibt also **einen** PR-Kanal (`cve-audit/pins-<datum>`), keine parallelen
+Renovate-Branches. Major-/Breaking-Updates erscheinen nur im Report (`Src:
+rnv (major)`) und werden **nie** automatisch gebumpt.
+
+**Installation:** Renovate liegt als separat gepinnte CLI im Image
+(`npm i -g renovate@44.222.1`), **nicht** in der `package.json` — das Paket ist
+AGPL-3.0-only und zieht ~124 transitive Dependencies mit, was unsere eigene
+Pins-Policy ad absurdum führen würde. Einschalten mit `ENABLE_RENOVATE=1`.
+
+**Lockfile-Pflicht (fail-closed):** Ein PR, der `package.json` ändert, aber das
+Lockfile unangetastet lässt, bricht `npm ci`. Deshalb ermittelt
+`findCoveringLockfile()` das abdeckende Lockfile — eigenes Verzeichnis oder,
+bei Monorepos mit `workspaces`, das Workspace-Root. Findet sich keines oder
+schlägt der Regen fehl, wird der Kandidat **aus dem PR entfernt** statt einen
+kaputten PR zu öffnen.
+
 ## Installation & Setup
 
 ### Voraussetzungen
@@ -385,6 +417,8 @@ Lokal ohne Docker braucht ein voller `scan` zusätzlich `trivy` im PATH.
 | `WORK_DIR` / `REPORTS_DIR` | nein | `/app` / `<WORK_DIR>/reports` | Pfad-Konventionen (Container-Setup); Report-Unterverzeichnisse je Tag. |
 | `UPDATE_MIN_AGE_DAYS` | nein | `3` | **Soaking** (v1.6.0): Ein Update wird erst angeboten/gepinnt, wenn die Zielversion so viele **Tage** alt ist (Schutz gegen Package-Poisoning). `0` = aus. Alternative **nur** bei belegtem HIGH/CRITICAL-CVE-Fix. |
 | `SHOW_EXOTIC_PRERELEASES` | nein | `0` | `1` = Nightly/Canary/Dev/Insiders-Kandidaten zusätzlich im Report zeigen (Default aus, Rauschkontrolle). |
+| `ENABLE_RENOVATE` | nein | `0` | `1` = Renovate-CLI als **Analyse-Quelle** mitlaufen lassen. Renovate legt **nie** eigene PRs an; seine Vorschläge landen gebündelt im `cve-audit/pins-<datum>`-PR. |
+| `RENOVATE_BIN` | nein | `renovate` | Pfad zum Renovate-Binary (im Image global installiert, exakt gepinnt). |
 
 **Item-Level-Skip**: Datei `.cve-audit-skip` im Repo-Root (wird im Inventar
 erkannt; Repo erscheint als `skip(repo-file)`). **`SKIP_REPOS`** klammert Repos

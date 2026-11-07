@@ -22,7 +22,8 @@ import {
   upstreamRepoFor,
   type GhRelease,
 } from './release-check.js';
-import { isPinnedPrereleaseSpec } from './pinning.js';
+import { isPinnedPrereleaseSpec, renovateToPinFindings } from './pinning.js';
+import { parseRenovateLog } from './renovate.js';
 import { ageInDays, updateEligibility } from './soaking.js';
 import { loadInventory } from './inventory.js';
 import { llmEnabled, triageFindings, type TriageInput } from './llm.js';
@@ -170,6 +171,12 @@ async function main(): Promise<void> {
       // Purer Selbsttest von Soaking + Pre-Release-Klassifikation (v1.6.0):
       // fixe Fake-Uhr, kein Netzwerk, kein Scan.
       process.exitCode = soakingTest();
+      return;
+    }
+    case 'renovate-test': {
+      // Renovate-Parser + Lockfile-Abdeckung (v1.7.0): reines Fixture-Parsing,
+      // kein Renovate-Aufruf, kein Netzwerk.
+      process.exitCode = renovateTest();
       return;
     }
     case 'digest-test': {
@@ -497,6 +504,94 @@ function fakeRepo(name: string, images: ImageFinding[]): RepoResult {
  * Ausnahme NUR bei belegtem H/C-CVE-Fix; Beta-Hinweis NUR für Pakete, die
  * schon im Beta-Kanal liegen.
  */
+/**
+ * Selbsttest Renovate (v1.7.0): Parser + Einordnung in PinFinding.
+ * Offline — eingebettetes JSONL-Fixture in der echten Renovate-Log-Form
+ * (`msg === "packageFiles with updates"`, Daten unter `config`).
+ */
+function renovateTest(): number {
+  let ok = true;
+  const check = (label: string, cond: boolean, detail = ''): void => {
+    process.stdout.write(`${cond ? 'OK  ' : 'FAIL'} ${label}${detail ? ` — ${detail}` : ''}\n`);
+    ok &&= cond;
+  };
+
+  const updateLog = (deps: unknown[]): string =>
+    JSON.stringify({
+      name: 'renovate',
+      level: 20,
+      msg: 'packageFiles with updates',
+      repository: 'local',
+      config: { npm: [{ packageFile: 'package.json', deps }] },
+      time: new Date().toISOString(),
+    });
+
+  const dep = (depName: string, currentValue: string, updates: unknown[]): unknown => ({
+    depName,
+    currentValue,
+    depType: 'dependencies',
+    datasource: 'npm',
+    updates,
+  });
+  const upd = (newVersion: string, updateType: string, age?: number): unknown => ({
+    newVersion,
+    newValue: newVersion,
+    updateType,
+    isBreaking: updateType === 'major',
+    releaseTimestamp: '2026-11-01T00:00:00.000Z',
+    newVersionAgeInDays: age,
+  });
+
+  // 1) Parser: zwei deps mit Updates
+  const multi = [
+    updateLog([
+      dep('lodash', '4.17.15', [upd('4.18.1', 'minor', 219)]),
+      dep('semver', '7.6.0', [upd('7.8.6', 'minor', 5)]),
+      dep('unchanged', '1.0.0', []),
+    ]),
+  ].join('\n');
+  const r1 = parseRenovateLog(multi);
+  check('Parser: ok + 2 Kandidaten', r1.ok && r1.candidates.length === 2, `n=${r1.candidates.length}`);
+
+  // 2) höchste newVersion je dep gewinnt
+  const highest = updateLog([
+    dep('pkg', '1.0.0', [upd('1.0.2', 'patch', 9), upd('1.2.0', 'minor', 4), upd('1.0.1', 'patch', 12)]),
+  ]);
+  const r2 = parseRenovateLog(highest);
+  check(
+    'Parser: höchste newVersion je dep',
+    r2.candidates[0]?.newVersion === '1.2.0',
+    r2.candidates[0]?.newVersion ?? 'n/a'
+  );
+
+  // 3) releaseTimestamp → ageDays
+  check('Parser: ageDays übernommen', r2.candidates[0]?.ageDays === 4, String(r2.candidates[0]?.ageDays));
+
+  // 4) kaputter/leerer Output → ok:false, kein Crash
+  const r4 = parseRenovateLog('{"kein":"jsonl"}\nMüll\n');
+  check('Parser: kaputter Output → ok:false', r4.ok === false && r4.candidates.length === 0, r4.note ?? '');
+
+  // 5) Major/Breaking nie fixable, minor schon
+  const withMajor = parseRenovateLog(
+    updateLog([dep('big', '1.0.0', [upd('2.0.0', 'major', 30)]), dep('small', '1.0.0', [upd('1.0.1', 'patch', 3)])])
+  );
+  const mapped = renovateToPinFindings('.', withMajor.candidates, []);
+  const majorF = mapped.find((f) => f.pkg === 'big');
+  const minorF = mapped.find((f) => f.pkg === 'small');
+  check('Major-Update als majorOrBreaking markiert', majorF?.majorOrBreaking === true);
+  check('Patch-Update nicht majorOrBreaking', minorF?.majorOrBreaking === false);
+  check('Renovate-Quelle gesetzt', minorF?.source === 'renovate');
+
+  // 6) Dedupe: bereits als floating Pin erfasst → keine Doppelmeldung
+  const dedupe = renovateToPinFindings('.', withMajor.candidates, [
+    { pkg: 'small', current: '^1.0.0', latest: '1.0.1', section: 'dependencies', manifestPath: 'package.json', severity: 'warn' },
+  ]);
+  check('Dedupe gegen floating-Findings', !dedupe.some((f) => f.pkg === 'small'), `n=${dedupe.length}`);
+
+  process.stdout.write(ok ? './ renovate-test PASS\n' : '✗ renovate-test FAIL\n');
+  return ok ? 0 : 1;
+}
+
 function soakingTest(): number {
   let ok = true;
   const check = (label: string, cond: boolean, detail = ''): void => {

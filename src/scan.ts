@@ -157,6 +157,8 @@ export interface Report {
     apiCalls: number;
     reminders: number; // offene Fix-PRs (Reminder-Sektion)
     imageVulns: { high: number; critical: number; images: number }; // Summe Base-Image-CVEs
+    /** v1.7.0: Vorschläge aus der Renovate-Analyse (separat von `unpinned`). */
+    renovateUpdates?: number;
   };
   reminders: ReminderInfo[]; // offene CVE-Fix-PRs (⏰-Sektion)
   pinsReminders: ReminderInfo[]; // offene Pins-PRs (📌-Sektion, findings leer) — JEDEN Lauf erwähnen
@@ -329,6 +331,10 @@ export async function runScan(opts: {
       imagePrs: results.filter((r) => r.imagePr?.status === 'created').length,
       pinsPrs: results.filter((r) => r.pinsPr?.status === 'created').length,
       unpinned: results.reduce((n, r) => n + (r.pins?.length ?? 0), 0),
+      renovateUpdates: results.reduce(
+        (n, r) => n + (r.pins?.filter((p) => p.source === 'renovate').length ?? 0),
+        0
+      ),
       apiCalls: ghStats.apiCalls,
       reminders: collectReminders(state).length,
       imageVulns: {
@@ -776,6 +782,7 @@ function renderMarkdown(report: Report): string {
     `${report.summary.imagePrs ? ` (+${report.summary.imagePrs} Image)` : ''}` +
     `${report.summary.pinsPrs ? ` (+${report.summary.pinsPrs} Pins)` : ''} · ` +
     `unpinned deps: ${report.summary.unpinned} · ` +
+    `${report.summary.renovateUpdates ? `Renovate-Vorschläge: ${report.summary.renovateUpdates} · ` : ''}` +
     `offene Fix-PRs (Reminder): ${report.summary.reminders}` +
     `${imageVulnPart} · ` +
     `GitHub-API-Calls: ${report.summary.apiCalls}`;
@@ -848,12 +855,14 @@ function pinningTable(pins: PinFinding[]): string {
     const beta = p.prereleaseHint
       ? `ℹ️ ${p.prereleaseHint} (${p.prereleaseLabel ?? '?'})`
       : '—';
-    return `| ${p.pkg} | ${p.current} | ${p.latest ?? '—'} | ${p.section} | ${p.severity} | ${soak} | ${beta} |`;
+    // v1.7.0: Quelle sichtbar machen (floating-Pin vs. Renovate-Analyse).
+    const src = p.source === 'renovate' ? (p.majorOrBreaking ? 'rnv (major)' : 'renovate') : 'pin';
+    return `| ${p.pkg} | ${p.current} | ${p.latest ?? '—'} | ${p.section} | ${p.severity} | ${soak} | ${beta} | ${src} |`;
   });
   return [
     '### 📌 Unpinned deps (package.json) — Floating-Specifier',
-    '| Package | Current | Latest exact | Scope | Sev | Soaking | Beta/RC |',
-    '|---|---|---|---|---|---|---|',
+    '| Package | Current | Latest exact | Scope | Sev | Soaking | Beta/RC | Src |',
+    '|---|---|---|---|---|---|---|---|',
     ...rows,
   ].join('\n');
 }

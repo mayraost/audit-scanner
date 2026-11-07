@@ -22,7 +22,13 @@ ENV TZ=Europe/Berlin
 ENV TRIVY_CACHE_DIR=/app/.cache/trivy
 COPY --from=aquasec/trivy:0.76.2 /usr/local/bin/trivy /usr/local/bin/trivy
 # TZ=Europe/Berlin: Busybox-crond löst Zeitzonen via zoneinfo auf → tzdata nötig
-RUN apk add --no-cache tzdata
+# git: Renovate (`--platform=local`) arbeitet auf einem echten Checkout (v1.7.0)
+RUN apk add --no-cache tzdata git
+# Renovate-CLI (v1.7.0): SEPARAT gepinnt, NICHT in package.json — AGPL-3.0-only
+# und ~124 transitive Deps würden unsere eigene Pins-Policy sprengen. Läuft
+# ausschliesslich als Analyse (`--dry-run=lookup`); PRs macht der Scanner.
+RUN npm i -g renovate@44.222.1 \
+  && ln -sf "$(npm root -g)/renovate/dist/renovate.js" /usr/local/bin/renovate
 WORKDIR /app
 COPY --from=build /app/dist ./dist
 COPY --from=deps-prod /app/node_modules ./node_modules
