@@ -227,6 +227,28 @@ Je Repo dedupliziert (Ref über alle Files gemerged), dann:
    Rebuild zieht neuen Digest"; stabil/unbekannt → „Pin auf neueren Tag
    erhöhen (Rebuild hilft nicht)". Die Datei wird nur nach erfolgreichem
    Scan-Lauf geschrieben (wie `state.json`).
+7. **Upstream-Release-Check (v1.6.3, `src/release-check.ts`)**: Registry-Tags
+   sind **nicht** die Release-Wahrheit. Findet der Freshness-Check keinen
+   neueren Registry-Tag (= bisher „aktuell"), wird zusätzlich das neueste
+   stabile GitHub-Release des Upstream-Repos abgefragt
+   (`GET /repos/<owner>/<repo>/releases?per_page=10`, erster Eintrag ohne
+   `prerelease`/`draft`) und per Manifest-HEAD geprüft, ob dieser Release-Tag
+   auf der Registry überhaupt publiziert wurde (Manifest 404 → kein Image). Bei
+   Bump-Kandidaten entfällt der Check (überflüssig, würde nur API-Calls
+   kosten); Fehler brechen den Lauf nie (Feld bleibt `null`, nur Log).
+   **Bekannter Fall:** `mcr.microsoft.com/playwright/mcp:v0.0.83` —
+   GitHub-Release `microsoft/playwright-mcp` v0.0.84 (31.10.2026) existiert,
+   MCR `tags/list` endet bei `v0.0.83`, `manifests/v0.0.84` → 404; das Image
+   wurde nie gepusht. Der Report (und die 🐳-Zeile im Telegram-Alert, **ohne**
+   eigenen Auslöser) sagt dann
+   `ℹ️ Release v0.0.84 existiert, kein Image publiziert` statt „aktuell".
+   Das Image→Repo-Mapping ist eine explizite Tabelle `UPSTREAM_REPOS` in
+   `src/release-check.ts` (playwright/mcp → microsoft/playwright-mcp,
+   aquasec/trivy → aquasecurity/trivy, pgvector/pgvector, searxng/searxng, …);
+   Docker-Official-Images (`postgres`, `node`, `python`, `golang`, `alpine`,
+   `library/*`) stehen bewusst auf `null` (kein sinnvolles GH-Release). Neue
+   Einträge dort nur mit belegtem Upstream-Repo ergänzen. Selbsttest:
+   `node dist/index.js release-version-test` (Fake-Releases, kein Netzwerk).
 
 ## 📌 Pinning-Enforcement (seit v1.5.0)
 

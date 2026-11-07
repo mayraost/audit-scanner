@@ -15,6 +15,13 @@ import {
   variantDriftTag,
 } from './image-scan.js';
 import { channelCompatible, classifyPrerelease } from './prerelease.js';
+import {
+  latestStableRelease,
+  releaseIsNewer,
+  upstreamReleaseCheck,
+  upstreamRepoFor,
+  type GhRelease,
+} from './release-check.js';
 import { isPinnedPrereleaseSpec } from './pinning.js';
 import { ageInDays, updateEligibility } from './soaking.js';
 import { loadInventory } from './inventory.js';
@@ -27,6 +34,7 @@ import {
   novelImageVulns,
   runScan,
   telegramBody,
+  upstreamNewerOnly,
   type Report,
   type RepoResult,
 } from './scan.js';
@@ -81,6 +89,9 @@ COMMANDS
   digest-test   Digest-Cache (v1.6.2): korruptes digests.json → leerer Start,
                 erster/zweiter Lauf (stabil) vs. geänderter Digest (beweglicher
                 Tag), 90-Tage-Prune. Fake-Datei in tmp, kein Netzwerk.
+  release-version-test  Upstream-Release-Check (v1.6.3): Registry-Tags sind nicht
+                die Release-Wahrheit (playwright-mcp v0.0.84 released, MCR-Tag
+                404). Fake-Releases/-Manifeste, kein Netzwerk.
 
 ENV
   GH_TOKEN            Pflicht (Bearer für api.github.com). Dev-Fallback lokal:
@@ -165,6 +176,12 @@ async function main(): Promise<void> {
       // Purer Selbsttest des Digest-Caches (v1.6.2): Fake-Datei in tmp,
       // fixe Fake-Uhr, kein Netzwerk, kein Scan.
       process.exitCode = digestTest();
+      return;
+    }
+    case 'release-version-test': {
+      // Purer Selbsttest des Upstream-Release-Checks (v1.6.3): Fake-Releases +
+      // Fake-Manifest-Antworten injiziert, kein Netzwerk, kein Scan.
+      process.exitCode = await releaseVersionTest();
       return;
     }
     case 'triage-test': {
@@ -624,9 +641,14 @@ function digestTest(): number {
 
     // 5) Report-Empfehlung klingt ehrlich je Fall
     const moving = imageVulnAdvice({ digestChanged: true });
-    const stable = imageVulnAdvice({ digestChanged: false });
+    const newerTag = imageVulnAdvice({ digestChanged: false, updateAvailable: true });
+    const releaseOnly = imageVulnAdvice({ digestChanged: false, updateAvailable: false, upstreamLatest: 'v0.0.84' });
+    const nothing = imageVulnAdvice({ digestChanged: false, updateAvailable: false, upstreamLatest: null });
     check('Empfehlung beweglicher Tag', /beweglich.*Rebuild/.test(moving), moving);
-    check('Empfehlung stabiler Tag (kein Rebuild-Rat)', /Pin auf neueren Tag/.test(stable) && !/Rebuild zieht/.test(stable), stable);
+    check('Empfehlung neuer Tag (kein Rebuild-Rat)', /Pin auf neueren Tag/.test(newerTag) && !/Rebuild zieht/.test(newerTag), newerTag);
+    // v1.6.3: Release ohne Image (playwright/mcp v0.0.84) darf NICHT zum Pin raten.
+    check('Empfehlung Release ohne Image', /abwarten/.test(releaseOnly) && !/Pin auf neueren/.test(releaseOnly), releaseOnly);
+    check('Empfehlung ohne alles: ehrlich, kein Handlungsdruck', /keine neuere Version/.test(nothing) && !/Pin auf neueren/.test(nothing), nothing);
     const line = imageVulnLines([{ repo: 'demo', image: ref, high: 6, critical: 0, digestChanged: false }]).find((l) => l.includes('•')) ?? '';
     check('Telegram-Zeile ≤ 120 Zeichen', line.length > 0 && line.length <= 120, `${line.length} Zeichen`);
   } finally {
@@ -634,6 +656,148 @@ function digestTest(): number {
   }
 
   process.stdout.write(ok ? './ digest-test PASS\n' : '✗ digest-test FAIL\n');
+  return ok ? 0 : 1;
+}
+
+/**
+ * Purer Selbsttest des Upstream-Release-Checks (v1.6.3, KEIN Netzwerk):
+ * GitHub-Releases + Manifest-Existenz werden injiziert (Fake-Daten).
+ * 1) v0.0.83 vs Release v0.0.84 → newerThanTag=true.
+ * 2) Tag fehlt auf der Registry (404 simuliert) → Note enthält "kein Image".
+ * 3) Docker-Official-Image `node` → kein Upstream-Repo, kein Fehler.
+ * 4) nicht-vergleichbare Version (2026.11.1-9ded3bec1) → kein Crash, false + note.
+ * 5) Prerelease-/Draft-Releases werden ignoriert.
+ * Zusätzlich: Registry-Fehler beim Release-Fetch → kein Throw, Report sagt
+ * NICHT "aktuell" (upstreamNewerOnly nur bei echtem neueren Release).
+ */
+async function releaseVersionTest(): Promise<number> {
+  let ok = true;
+  const check = (label: string, cond: boolean, detail = ''): void => {
+    process.stdout.write(`${cond ? 'OK  ' : 'FAIL'} ${label}${detail ? ` — ${detail}` : ''}\n`);
+    ok &&= cond;
+  };
+  const releasesFor = (tags: string[], prereleaseAt: number[] = [], draftAt: number[] = []): GhRelease[] =>
+    tags.map((tag_name, i) => ({ tag_name, prerelease: prereleaseAt.includes(i), draft: draftAt.includes(i) }));
+
+  // (a) playwright/mcp: Registry-Tag v0.0.83, Upstream-Release v0.0.84
+  const pw = await upstreamReleaseCheck(
+    { base: 'playwright/mcp', currentTag: 'v0.0.83', registry: 'mcr' },
+    {
+      fetchReleases: async () => releasesFor(['v0.0.84', 'v0.0.83']),
+      manifestExists: async () => true,
+    }
+  );
+  check('(a) v0.0.83 vs Release v0.0.84 → newerThanTag', pw.newerThanTag === true, `note=${pw.note ?? '—'}`);
+  check('(a) latestRelease = v0.0.84', pw.latestRelease === 'v0.0.84', String(pw.latestRelease));
+  check('(a) Mapping playwright/mcp → microsoft/playwright-mcp', upstreamRepoFor('playwright/mcp') === 'microsoft/playwright-mcp');
+  check('(a) Manifest vorhanden → KEINE "kein Image"-Note', pw.releaseWithoutImage !== true && !/kein Image/.test(pw.note ?? ''));
+
+  // (b) Release da, Tag fehlt auf der Registry (404 simuliert)
+  let headChecked = '';
+  const missing = await upstreamReleaseCheck(
+    { base: 'playwright/mcp', currentTag: 'v0.0.83-mcr', registry: 'mcr' },
+    {
+      // Cache-Hinweis: key = registry|base|currentTag — `-mcr`-Suffix hält den
+      // Fall getrennt von (a), die Logik ist dieselbe (coerce strippt das Suffix).
+      // anderer current-Tag als (a): der Prozess-Cache ist je Ref gekeyt.
+      fetchReleases: async () => releasesFor(['v0.0.84']),
+      manifestExists: async (base, tag, registry) => {
+        headChecked = `${base}:${tag}@${registry}`;
+        return false;
+      },
+    }
+  );
+  check('(b) Tag fehlt (404) → note enthält "kein Image"', /kein Image/.test(missing.note ?? ''), missing.note ?? '—');
+  check('(b) note nennt Registry-Label + 404', /MCR/.test(missing.note ?? '') && /404/.test(missing.note ?? ''));
+  check('(b) releaseWithoutImage = true', missing.releaseWithoutImage === true);
+  check('(b) Manifest-Check für Release-Tag auf der Registry', headChecked === 'playwright/mcp:v0.0.84@mcr', headChecked);
+
+  // (c) Docker-Official-Image: kein Upstream-Repo, kein Fehler, kein Netzwerk
+  let fetchCalled = false;
+  const nodeRes = await upstreamReleaseCheck(
+    { base: 'node', currentTag: '26.13.0-alpine3.24', registry: 'docker-hub' },
+    {
+      fetchReleases: async () => {
+        fetchCalled = true;
+        return [];
+      },
+    }
+  );
+  const libRes = await upstreamReleaseCheck({ base: 'library/node', currentTag: '26.13.0', registry: 'docker-hub' });
+  check('(c) node → kein Upstream-Repo', upstreamRepoFor('node') === null && nodeRes.latestRelease === null && !fetchCalled);
+  check('(c) node → newerThanTag=false, kein Fehler', nodeRes.newerThanTag === false && /kein Upstream-Repo/.test(nodeRes.note ?? ''), nodeRes.note ?? '—');
+  check('(c) library/node → kein Upstream-Repo', upstreamRepoFor('library/node') === null && libRes.newerThanTag === false);
+
+  // (d) nicht semver-vergleichbare Versionen → kein Crash, false + note
+  const odd = await upstreamReleaseCheck(
+    { base: 'cloudflare/cloudflared', currentTag: '2026.11.1-9ded3bec1', registry: 'ghcr' },
+    {
+      fetchReleases: async () => releasesFor(['2026.11.1-beta-x']),
+      manifestExists: async () => true,
+    }
+  );
+  check("(d) '2026.11.1-9ded3bec1' → kein Crash", odd.latestRelease !== undefined, `latest=${String(odd.latestRelease)}`);
+  const odd2 = await upstreamReleaseCheck(
+    { base: 'demo/tool', currentTag: 'main-20261101', registry: 'ghcr' },
+    { fetchReleases: async () => releasesFor(['v9.9.9']) }
+  );
+  check('(d) nicht vergleichbar → newerThanTag=false + note', odd2.newerThanTag === false && /nicht semver-vergleichbar/.test(odd2.note ?? ''), odd2.note ?? '—');
+  check('(d) releaseIsNewer(Build-Meta) reduziert auf Zahlen-Teil', releaseIsNewer('2026.11.0-abc', '2026.11.1-9ded3bec1') === true);
+
+  // (e) Prerelease-/Draft-Releases werden ignoriert
+  // Index 0 = prerelease, Index 1 = draft → beide raus, v0.0.83 bleibt.
+  const latest = latestStableRelease(releasesFor(['v0.0.85', 'v0.0.84', 'v0.0.83'], [0], [1]));
+  check('(e) latestStableRelease überspringt prerelease/draft', latest === 'v0.0.83', String(latest));
+  const preOnly = await upstreamReleaseCheck(
+    { base: 'playwright/mcp', currentTag: 'v0.0.84', registry: 'mcr' },
+    {
+      fetchReleases: async () => releasesFor(['v0.0.85', 'v0.0.84'], [0]),
+      manifestExists: async () => false,
+    }
+  );
+  check('(e) nur Prerelease neuer → stable v0.0.84 genommen, kein 0.0.85',
+    preOnly.latestRelease === 'v0.0.84' && preOnly.newerThanTag === false, `latest=${String(preOnly.latestRelease)}`);
+  const draftOnly = await upstreamReleaseCheck(
+    { base: 'pgvector/pgvector', currentTag: '0.8.7', registry: 'docker-hub' },
+    {
+      fetchReleases: async () => releasesFor(['v0.9.0', 'v0.8.7'], [], [0]),
+      manifestExists: async () => true,
+    }
+  );
+  check('(e) Draft-Release wird ignoriert', draftOnly.latestRelease === 'v0.8.7' && draftOnly.newerThanTag === false, String(draftOnly.latestRelease));
+
+  // (f) Fehler im Release-Fetch → kein Throw, keine falsche Aussage
+  const broken = await upstreamReleaseCheck(
+    { base: 'aquasec/trivy', currentTag: '0.76.2', registry: 'docker-hub' },
+    {
+      fetchReleases: async () => {
+        throw new Error('simulierter GitHub-Fehler');
+      },
+    }
+  );
+  check('(f) Fetch-Fehler → latestRelease null, kein Throw', broken.latestRelease === null && broken.newerThanTag === false, broken.note ?? '—');
+  check('(f) Mapping aquasec/trivy → aquasecurity/trivy', upstreamRepoFor('aquasec/trivy') === 'aquasecurity/trivy');
+
+  // (g) Report-Text: Registry aktuell + Release ohne Image ≠ "aktuell"
+  const baseFinding: ImageFinding = {
+    image: 'playwright/mcp:v0.0.83',
+    base: 'playwright/mcp',
+    current: 'v0.0.83',
+    registry: 'mcr',
+    pinned: true,
+    floating: false,
+    digestPinned: false,
+    sourceFiles: ['Dockerfile'],
+    vulns: { high: 0, critical: 0 },
+    newestSameMajor: null,
+    exactPin: null,
+    updateAvailable: false,
+  };
+  check('(g) upstreamNewerOnly erkennt Release-ohne-Image', upstreamNewerOnly({ ...baseFinding, upstreamLatest: 'v0.0.84' }));
+  check('(g) ohne Release → KEIN upstream-Only', !upstreamNewerOnly({ ...baseFinding, upstreamLatest: null }));
+  check('(g) mit Update → upstream-Only false', !upstreamNewerOnly({ ...baseFinding, upstreamLatest: 'v0.0.84', updateAvailable: true }));
+
+  process.stdout.write(ok ? './ release-version-test PASS\n' : '✗ release-version-test FAIL\n');
   return ok ? 0 : 1;
 }
 

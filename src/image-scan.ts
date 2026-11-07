@@ -29,6 +29,7 @@ import { b64, decodeB64, ghFetch, ghJson, ghJsonOrNull } from './github.js';
 import type { RepoInfo } from './inventory.js';
 import type { FixResult } from './fix-pr.js';
 import { imageDigest, imagePublishedAt } from './publish-dates.js';
+import { upstreamReleaseCheck } from './release-check.js';
 import { updateEligibility, type Eligibility } from './soaking.js';
 import { upsertEntry, type State } from './state.js';
 
@@ -85,6 +86,14 @@ export interface ImageFinding {
    * hilft nur ein neuer Tag (Empfehlung im Report/Telegram).
    */
   digestChanged?: boolean;
+  /**
+   * v1.6.3: neuestes stabiles GitHub-Release des Upstream-Repos
+   * (z. B. "v0.0.84"), null = unbekannt/kein Upstream-Repo. Registry-Tags
+   * sind NICHT die Release-Wahrheit (release-check.ts).
+   */
+  upstreamLatest?: string | null;
+  /** v1.6.3: Klartext-Hinweis zum Release-Check (z. B. "… kein Image auf MCR (404)"). */
+  upstreamNote?: string | null;
 }
 
 /** Bump-Plan (je File): literal `${base}:${oldTag}` → `${base}:${newTag}`. */
@@ -743,6 +752,23 @@ export async function scanRepoImages(
         if (existing) existing.bumps.push(bump);
         else bumpPlan.push({ file, bumps: [bump] });
       }
+      continue;
+    }
+    // Upstream-Release-Check (v1.6.3) NUR hier: Registry und Upstream sind sich
+    // im Zahlen-Stand einig — aber Registry-Tags sind nicht die Release-Wahrheit
+    // (playwright-mcp v0.0.84 released, MCR-Tag fehlt → 404). Bei Bump-Kandidaten
+    // oben ist der Check überflüssig und kostet nur API-Calls. Fehler brechen
+    // den Lauf nie: Felder bleiben null, nur Log.
+    try {
+      const rel = await upstreamReleaseCheck({ base: f.base, currentTag: f.current, registry: f.registry });
+      if (rel.latestRelease || rel.note) {
+        f.upstreamLatest = rel.latestRelease;
+        f.upstreamNote = rel.note ?? null;
+      }
+    } catch (err) {
+      log(
+        `Upstream-Release-Check ${f.image} fehlgeschlagen: ${err instanceof Error ? err.message.slice(0, 120) : '?'}`
+      );
     }
   }
   return { findings, bumpPlan };

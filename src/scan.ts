@@ -117,6 +117,10 @@ export interface ImageVulnFinding {
   digestChanged?: boolean;
   digest?: string | null;
   previousDigest?: string | null;
+  /** v1.6.3: es gibt einen neueren Tag auf der Registry (Pin hochziehen hilft). */
+  updateAvailable?: boolean;
+  /** v1.6.3: neuestes Upstream-GitHub-Release (Info, wenn kein Image publiziert). */
+  upstreamLatest?: string | null;
 }
 
 /**
@@ -125,10 +129,17 @@ export interface ImageVulnFinding {
  * exakten Tag bringt ein Rebuild aber nichts (Owner-Feedback Prod-Report
  * 2026-11-07).
  */
-export function imageVulnAdvice(f: Pick<ImageVulnFinding, 'digestChanged'>): string {
-  return f.digestChanged
-    ? 'Tag beweglich, Rebuild zieht neuen Digest'
-    : 'Pin auf neueren Tag erhöhen (Rebuild hilft nicht)';
+export function imageVulnAdvice(
+  f: Pick<ImageVulnFinding, 'digestChanged' | 'updateAvailable' | 'upstreamLatest'>
+): string {
+  // 1) Beweglicher Tag: Rebuild zieht den aktuellen Digest.
+  if (f.digestChanged) return 'Tag beweglich, Rebuild zieht neuen Digest';
+  // 2) Neuerer Tag existiert: Pin nachziehen.
+  if (f.updateAvailable) return 'Pin auf neueren Tag erhöhen';
+  // 3) Release existiert, aber kein Image: warten, nichts tun.
+  if (f.upstreamLatest) return `nur Release ${f.upstreamLatest}, kein neueres Image — abwarten`;
+  // 4) Nichts verfügbar: ehrlich sagen, statt zum Handeln zu drängen.
+  return 'keine neuere Version verfügbar — CVEs im Base-Image';
 }
 
 export interface Report {
@@ -373,6 +384,10 @@ export function collectImageVulnFindings(repos: RepoResult[]): ImageVulnFinding[
         digestChanged: f.digestChanged ?? false,
         digest: f.digest ?? null,
         previousDigest: f.previousDigest ?? null,
+        // v1.6.3: Signale für die ehrliche Empfehlung — ohne diese beiden weiß
+        // die 🛡-Zeile nicht, ob überhaupt eine neuere Version existiert.
+        updateAvailable: f.updateAvailable ?? false,
+        upstreamLatest: f.upstreamLatest ?? null,
       });
     }
   }
@@ -843,6 +858,23 @@ function pinningTable(pins: PinFinding[]): string {
   ].join('\n');
 }
 
+/**
+ * v1.6.3: Upstream-Release neuer als der Tag, aber KEIN neuerer Registry-Tag
+ * (Registry und Release laufen auseinander — z. B. playwright-mcp: Release
+ * v0.0.84 da, MCR-Image fehlt). Reine Report-Information, kein Telegram-Trigger.
+ */
+export function upstreamNewerOnly(
+  f: Pick<ImageFinding, 'note' | 'updateAvailable' | 'floating' | 'exactPin' | 'upstreamLatest'>
+): boolean {
+  return (
+    !f.note &&
+    !f.updateAvailable &&
+    !(f.floating && f.exactPin) &&
+    typeof f.upstreamLatest === 'string' &&
+    f.upstreamLatest.length > 0
+  );
+}
+
 /** 🐳-Sektion je Repo (Report-MD): nur Images mit vulns/update/note. */
 function imageTable(images: ImageFinding[]): string {
   const rows: string[] = [];
@@ -870,6 +902,13 @@ function imageTable(images: ImageFinding[]): string {
       // v1.6.0: semver-gleicher Tag mit anderer OS-Basis (pg17 → pg17-trixie,
       // slim → slim-bookworm). Kein Bump/PR — nur Sichtbarkeit im Report.
       rows.push(`| ${f.image} | ${f.current} | — | ${vc} | variant drift: ${f.variantDrift} |`);
+    } else if (upstreamNewerOnly(f)) {
+      // v1.6.3: Registry hat nichts Neueres, das Upstream-Release schon —
+      // hier KEIN "aktuell" mehr (Registry-Tags sind nicht die Release-Wahrheit).
+      rows.push(
+        `| ${f.image} | ${f.current} | — | ${vc} | ` +
+          `ℹ️ Release ${f.upstreamLatest} existiert, kein Image publiziert${f.upstreamNote ? ` (${f.upstreamNote})` : ''} |`
+      );
     } else {
       // v1.6.2: Digest-Vergleich belegt, ob ein Rebuild überhaupt etwas zieht.
       const digestPart =
@@ -1044,10 +1083,13 @@ export function telegramBody(
   // NICHT mehr drin: semver-gleicher Tag mit anderer OS-Basis ist kein Update
   // und war reines Rauschen (Prod-Alert 2026-11-07). Steht nur im Report.
   // Pinned+aktuelle Images sind ebenfalls raus (→ 🛡-Sektion für CVEs).
+  // v1.6.3: upstreamNewerOnly (Release existiert, Image fehlt) ist ebenfalls
+  // KEIN Handlungspunkt → löst keinen Versand aus; wenn der Alert aber ohnehin
+  // rausgeht, bekommt das Repo seine Zeile (ehrlicher als "aktuell").
   const imgRepos = report.repos.filter(
     (r) =>
       !!r.imagePr?.prUrl ||
-      r.images?.some((i) => !i.note && (i.updateAvailable || i.floating))
+      r.images?.some((i) => !i.note && (i.updateAvailable || i.floating || upstreamNewerOnly(i)))
   );
   if (imgRepos.length > 0) {
     lines.push('🐳 Image-Scan (Dockerfile/compose):');
@@ -1055,8 +1097,9 @@ export function telegramBody(
       lines.push(`*${r.name}*:`);
       for (const f of r.images!) {
         // skip: unscannable (note), pinned+aktuell und reiner variantDrift —
-        // nur echte Handlungspunkte (Update/floating) kommen in den Alert.
-        if (f.note || (!f.updateAvailable && !f.floating)) continue;
+        // nur echte Handlungspunkte (Update/floating) plus v1.6.3 die
+        // Release-ohne-Image-Info kommen in den Alert.
+        if (f.note || (!f.updateAvailable && !f.floating && !upstreamNewerOnly(f))) continue;
         const vc = `H${f.vulns.high}/C${f.vulns.critical}`;
         // v1.6.0 Soaking: zu junge Kandidaten werden im Alert NICHT als Aktion
         // gezeigt (nur Report) — Package-Poisoning-Schutz.
@@ -1068,6 +1111,9 @@ export function telegramBody(
         } else if (f.floating && f.exactPin) {
           const badge = f.eligibility === 'too-young' ? ` ⏳ ${f.eligibilityLabel}` : '';
           lines.push(`  • ${f.image} → pin ${f.exactPin}${badge} [${vc}]`);
+        } else if (upstreamNewerOnly(f)) {
+          // v1.6.3: NICHT "aktuell" — Release da, Image fehlt (kein Trigger).
+          lines.push(`  • ${f.image} [${vc}] — ℹ️ Release ${f.upstreamLatest} existiert, kein Image publiziert`);
         } else {
           lines.push(
             `  • ${f.image} [${vc}] — ${f.pinned ? 'pinned, aktuell' : 'floating (Rebuild aktualisiert)'}`
