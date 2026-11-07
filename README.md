@@ -271,10 +271,22 @@ gescanntem Repo:
    **einem PR** (`cve-audit/pins-<date>`), alle package.json-Manifests des
    Repos in derselben Branch. Bump auf exakte latest-Version, Downgrade-Guard
    analog CVE-Fix. Major-Sprünge werden im PR-Body mit `⚠️ major jump`
-   markiert und sind bewusst vom Menschen zu akzeptieren. Lockfile-Regen im
+   markiert und sind bewusst vom Menschen zu akzeptieren.
+   **Peer-aware (seit v1.7.2):** deklariert eine andere direkte dep des
+   Manifests eine `peerDependencies`-Range für das Paket (Payload verlangt
+   `graphql: "^16.8.1"`), wird nicht auf `dist-tags.latest` (17.x) gepinnt,
+   sondern auf die höchste Version **innerhalb der Range** (16.14.2); ist keine
+   auflösbar, fliegt der Kandidat fail-closed aus dem PR. Grund: der naive
+   latest-Pin ließ `npm ci` am 07.11.2026 mit `ERESOLVE` scheitern.
+   **Lockfile-Regen fail-closed (seit v1.7.2):** Regen läuft **vor** jedem
+   Schreibzugriff und ist mit dem Manifest-PUT alles-oder-nichts. Scheitert er,
+   bekommt das betroffene Manifest **keinen** Commit im PR (kein
+   `package.json` ohne `package-lock.json`), der PR wird `draft` und trägt
+   `⚠️ … NOT applied … Do not merge`. Der Body behauptet
+   „Lockfiles regenerated" nur noch, wenn es stimmt. Lockfile-Regen im
    Manifestverzeichnis (`npm install --package-lock-only`-Style, pnpm analog
-   via corepack `--lockfile-only`); Nested-Manifests ohne Lockfile im selben
-   Verzeichnis → manuelle Regen-Note.
+   via corepack `--lockfile-only`); ohne abdeckendes Lockfile → fail-closed.
+   **Commit-Messages ohne `[skip ci]`** (siehe Docker-Abschnitt).
 5. **Report/Telegram**: Report-Sektion `📌 Unpinned deps (package.json)` je
    Repo (`pkg | current ^1.2.3 | latest exact X.Y.Z | scope | sev | soaking |
    beta`), Summary `unpinned deps: N` + `pinsPrs`-Zähler, Telegram `📌 Unpinned
@@ -356,8 +368,10 @@ Pins-Policy ad absurdum führen würde. Einschalten mit `ENABLE_RENOVATE=1`.
 Lockfile unangetastet lässt, bricht `npm ci`. Deshalb ermittelt
 `findCoveringLockfile()` das abdeckende Lockfile — eigenes Verzeichnis oder,
 bei Monorepos mit `workspaces`, das Workspace-Root. Findet sich keines oder
-schlägt der Regen fehl, wird der Kandidat **aus dem PR entfernt** statt einen
-kaputten PR zu öffnen.
+schlägt der Regen fehl, wird der Kandidat **gar nicht erst committet** (seit
+v1.7.2: Regen vor jedem Schreibzugriff, alles-oder-nichts) statt einen
+kaputten PR zu öffnen; der PR wird Draft + `⚠️ NOT applied`. Renovate-Ziele
+laufen durch dasselbe Peer-Gate wie floating Pins.
 
 ## Installation & Setup
 
@@ -510,9 +524,15 @@ Reports liegen unter **`/app/reports/<YYYY-MM-DD>/`** (untagged Drafts in
   `/app/crontabs/node` (root-owned, Pflicht) und startet
   `crond -f -l 8 -L logs/crond.log`. Cron-Job ruft `bin/scan-wrapper.sh`
   auf (Log-Rotate > 5 MB → Start-Tail behalten).
-- **[skip ci]-Verhalten eigener PR-Commits**: Commits, die über die eigenen
-  Fix-PRs landen, dürfen den Scanner nicht triggern — ist im Deploy-Workflow
-  durch Commit-Marker sichergestellt, damit keine PR-Recursion entsteht.
+- **Kein `[skip ci]` in eigenen PR-Commits (seit v1.7.2)**: Commits, die über
+  die eigenen Fix-/Pins-/Image-PRs landen, tragen **keinen** Skip-Marker.
+  Coolify überspringt bei `[skip ci]`/`[skip cd]` den Auto-Deploy **still** und
+  antwortet dem GitHub-Webhook trotzdem `200 OK` — 5 Apps hatten am 07.11.2026
+  deshalb keinen Deploy-Record bei komplett grünen Webhooks. Ein Deploy eines
+  reinen Pin-Bumps ist unschädlich (kein Verhaltens-Change); Blockieren ist
+  schlimmer. Die Rekursionsgefahr (Scanner scannt Scanner) fällt ins Leere, weil
+  das Repo derzeit selbst exakt gepinnt ist (self-scan leer).
+
 - Coolify Typ: Docker-Compose-App, Build aus Repo-Root, **keine Ports /
   keine Domain / kein networks-Block** (implizites Projekt-Default-Netz).
 
@@ -526,6 +546,10 @@ Kompakte Release-Historie (git history; Version in package.json):
 | v1.4.0 | Image-Scan (Dockerfile/compose, `trivy image` ohne Docker-Daemon, Freshness-Check) — Image-PRs bewusst ohne daily Reminder |
 | v1.5.0 | Exact-Pin-Enforcement: CVE-Bumps schreiben exakte Versionen; Pins-PRs (`cve-audit/pins-*`) für floating npm-Specifier; floating Image-Tags → Pinning-PRs |
 | v1.5.1 | Archivierte Repos hard-guard: beim Inventar-Load komplett gefiltert (kein Report/Telegram/Log/`--only`-Treffer) |
+| v1.6.3 | Upstream-Release-Check (Registry-Tags ≠ Release-Wahrheit) |
+| v1.7.0 | Renovate als Analyse-Quelle; Lockfile-Regen fail-closed |
+| v1.7.1 | Registry-Tag-Präfix beim Release-Check (trivy `v0.76.2` vs `0.76.2`) |
+| v1.7.2 | Deploybare Pins-PRs: kein `[skip ci]`, peer-aware Pins, Lockfile alles-oder-nichts + Draft-Warnung, Quay im Release-Check, `pinning-test` |
 
 ## Tests & Sicherheit
 
@@ -539,6 +563,12 @@ Kompakte Release-Historie (git history; Version in package.json):
   `digests.json` → leerer Start, erster Lauf setzt `firstSeen`, gleicher Digest
   → stabil, geänderter Digest → `digestChanged` + `previousDigest`,
   90-Tage-Prune, Empfehlungstexte + Telegram-Zeilenlänge.
+- `pinning-test` (v1.7.2) — Pins-PR-Qualität **offline** (Fake-Registry,
+  Fake-GitHub-contents, Fake-Lockfile-Regen): Peer-Konflikt → Ausweichversion
+  bzw. fail-closed kein Pin, Regen-Fehler → **kein** Manifest-Commit im PR
+  (Draft + `⚠️ NOT applied`), Lockfile-Commit vor Manifest-Commit, keine
+  `[skip ci]`-Marker, Image-Tag-Präfix-Flip für Docker Hub/MCR/Quay und
+  „kein Image" nur bei belastbarer Probe.
 - `image-vulns-test` — synthetische Report-/State-Objekte: Legacy-`state.json`
   ohne `imageVulns`-Feld parst, Novelty-Regel (erster Lauf / unverändert /
   geänderte H/C-Zahl) und Telegram-🛡-Sektion inkl. 15-Zeilen-Kappung.

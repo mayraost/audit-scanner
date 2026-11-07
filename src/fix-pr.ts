@@ -165,7 +165,7 @@ export async function createFixPr(
           branch,
           reqFile.sha,
           updated,
-          `chore(cve-audit): bump ${group.findings.map((f) => f.pkg).join(', ')} in ${reqPath} [skip ci]`
+          `chore(cve-audit): bump ${group.findings.map((f) => f.pkg).join(', ')} in ${reqPath}`
         );
         for (const line of pb) bumped.push(line);
         continue;
@@ -197,7 +197,7 @@ export async function createFixPr(
         branch,
         pkgFile.sha,
         updatedPkg,
-        `chore(cve-audit): bump vulnerable dependencies in ${pkgPath} [skip ci]`
+        `chore(cve-audit): bump vulnerable dependencies in ${pkgPath}`
       );
 
       // pnpm >= 12 liest pnpm.overrides aus package.json NICHT mehr ("The pnpm field
@@ -231,7 +231,7 @@ export async function createFixPr(
               branch,
               lockFile.sha,
               regenerated.content,
-              `chore(cve-audit): regen ${lockPath} [skip ci]`
+              `chore(cve-audit): regen ${lockPath}`
             );
           } else if (regenerated?.note != null) {
             lockNote = regenerated.note;
@@ -307,7 +307,7 @@ async function renderPnpmWorkspaceOverrides(
     {
       method: 'PUT',
       body: JSON.stringify({
-        message: 'chore(cve-audit): pnpm overrides in pnpm-workspace.yaml [skip ci]',
+        message: 'chore(cve-audit): pnpm overrides in pnpm-workspace.yaml',
         content: b64(updated),
         sha: file?.sha,
         branch,

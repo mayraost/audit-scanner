@@ -35,7 +35,7 @@ import { upsertEntry, type State } from './state.js';
 
 const execFileP = promisify(execFile);
 
-export type Registry = 'docker-hub' | 'ghcr' | 'mcr' | 'other';
+export type Registry = 'docker-hub' | 'ghcr' | 'mcr' | 'quay' | 'other';
 
 export interface ImageFinding {
   /** Image-Ref wie im File geschrieben (z. B. "aquasec/trivy:0.76.1"). */
@@ -245,6 +245,8 @@ export function splitRef(ref: string): { base: string; tag: string | null; diges
     if (host === 'ghcr.io') registry = 'ghcr';
     else if (/^(docker\.io|index\.docker\.io|registry-1\.docker\.io)$/.test(host)) registry = 'docker-hub';
     else if (host === 'mcr.microsoft.com') registry = 'mcr';
+    // Quay (v1.7.2): Release-Check kann dort ebenfalls Manifeste prüfen.
+    else if (host === 'quay.io') registry = 'quay';
     else registry = 'other';
     base = rest.slice(slash + 1);
   }
@@ -887,7 +889,7 @@ export async function createImagePr(repo: RepoInfo, bumpPlan: ImageBumpPlan[], s
         {
           method: 'PUT',
           body: JSON.stringify({
-            message: `chore(cve-audit): pin docker image tags to exact versions [skip ci]`,
+            message: `chore(cve-audit): pin docker image tags to exact versions`,
             content: b64(updated),
             sha: file.sha,
             branch,

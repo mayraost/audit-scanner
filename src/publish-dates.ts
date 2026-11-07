@@ -114,7 +114,7 @@ async function pypiPublishedAt(pkg: string, version: string): Promise<PublishDat
 export async function imagePublishedAt(
   base: string,
   tag: string,
-  registry: 'docker-hub' | 'ghcr' | 'mcr' | 'other'
+  registry: DigestRegistry
 ): Promise<PublishDateResult> {
   const key = `image|${registry}|${base}|${tag}`;
   const hit = cache.get(key);
@@ -131,11 +131,10 @@ export async function imagePublishedAt(
 
 /**
  * Registry-Kennung für den Digest-Lookup. Bewusst lokaler Typ (statt
- * `Registry` aus image-scan.ts): er akzeptiert `'mcr'` bereits, auch wenn der
- * Image-Scan seine Registry-Erkennung noch nicht erweitert hat — Aufrufer mit
- * `Registry` übergeben den Wert kovariant und kompatibel.
+ * `Registry` aus image-scan.ts); deckungsgleich mit image-scan.Registry seit
+ * v1.7.2 (inkl. `mcr` und `quay`) — Aufrufer übergeben den Wert kovariant.
  */
-export type DigestRegistry = 'docker-hub' | 'ghcr' | 'mcr' | 'other';
+export type DigestRegistry = 'docker-hub' | 'ghcr' | 'mcr' | 'quay' | 'other';
 
 /** Ergebnis eines Digest-Lookups; `note` erklärt ein fehlendes Digest. */
 export interface ImageDigestResult {
@@ -254,6 +253,13 @@ export async function imageDigest(
       `https://mcr.microsoft.com/v2/${base}/manifests/${encodeURIComponent(tag)}`,
       {},
       'MCR'
+    );
+  } else if (registry === 'quay') {
+    // Quay (v1.7.2): Manifest-Digest ohne Token (Tool-Images sind public).
+    out = await manifestDigest(
+      `https://quay.io/v2/${base}/manifests/${encodeURIComponent(tag)}`,
+      {},
+      'Quay'
     );
   } else {
     out = { digest: null, note: 'Registry ohne Digest-Lookup (fail-open)' };
