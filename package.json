@@ -5,7 +5,7 @@
   "description": "Nightly CVE-Audit-Scanner: GitHub-Repos scannen (trivy), Advisories matchen, Telegram-Report, optionale Auto-Fix-PRs.",
   "type": "module",
   "engines": {
-    "node": ">=24"
+    "node": "26.13.0"
   },
   "scripts": {
     "build": "tsc",
