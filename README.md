@@ -213,6 +213,20 @@ Je Repo dedupliziert (Ref über alle Files gemerged), dann:
    `ENABLE_FIX_PRS=0` gibt es keinen State: alle Einträge gelten als novel
    (nur Report), kein State-Write. Die 🐳-Sektion filtert weiterhin
    update/floating und zeigt weiter **keine** gepinnten+aktuellen Images.
+   Als Empfehlung stand dort bisher pauschal „Rebuild/Base-Image
+   aktualisieren" — seit v1.6.2 ersetzt durch den Digest-Vergleich (Punkt 6).
+6. **Digest-Vergleich / beweglicher Tag (v1.6.2)**: je gescanntem Image-Ref
+   wird der Manifest-Digest (`Docker-Content-Digest` per HEAD auf
+   `/v2/<repo>/manifests/<tag>`; Docker Hub + GHCR mit anonymous Token, MCR
+   ohne Auth) geholt und in `reports/digests.json` verglichen
+   (`{ "<ref>": { digest, firstSeen, lastSeen, changes[] } }`, 90-Tage-Prune
+   für Refs, die nicht mehr im Inventar sind; korruptes JSON → leerer Start).
+   Weicht der Digest vom letzten Lauf ab, ist der Tag **beweglich**
+   (`digestChanged: true`, `previousDigest` gesetzt). Die Empfehlung im
+   Report/Telegram ist entsprechend ehrlich: beweglich → „Tag beweglich,
+   Rebuild zieht neuen Digest"; stabil/unbekannt → „Pin auf neueren Tag
+   erhöhen (Rebuild hilft nicht)". Die Datei wird nur nach erfolgreichem
+   Scan-Lauf geschrieben (wie `state.json`).
 
 ## 📌 Pinning-Enforcement (seit v1.5.0)
 
@@ -464,6 +478,11 @@ Kompakte Release-Historie (git history; Version in package.json):
 - `state-test` — simuliertes State + PR-Status-Check gegen
   `mayraost/audit-scanner` mit nicht existierendem Fake-Branch (keine echten
   PRs, kein Telegram-Versand).
+- `soaking-test` — Soaking-Gates + Pre-Release-Klassifikation mit fixer Fake-Uhr.
+- `digest-test` — Digest-Cache ohne Netzwerk (Fake-Datei in tmp): korruptes
+  `digests.json` → leerer Start, erster Lauf setzt `firstSeen`, gleicher Digest
+  → stabil, geänderter Digest → `digestChanged` + `previousDigest`,
+  90-Tage-Prune, Empfehlungstexte + Telegram-Zeilenlänge.
 - `image-vulns-test` — synthetische Report-/State-Objekte: Legacy-`state.json`
   ohne `imageVulns`-Feld parst, Novelty-Regel (erster Lauf / unverändert /
   geänderte H/C-Zahl) und Telegram-🛡-Sektion inkl. 15-Zeilen-Kappung.

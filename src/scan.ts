@@ -24,6 +24,7 @@ import { fetchAdvisories, GH_ECOSYSTEM, type AdvisoryHit } from './advisories.js
 import { loadInventory, MANIFEST_MAP, type Ecosystem, type RepoInfo } from './inventory.js';
 import { createFixPr, type FixFinding, type FixResult } from './fix-pr.js';
 import { createImagePr, scanRepoImages, type ImageFinding } from './image-scan.js';
+import { openDigestSession } from './digest-cache.js';
 import { collectPinning, createPinsPr, type PinFinding } from './pinning.js';
 import {
   ageDays,
@@ -108,6 +109,26 @@ export interface ImageVulnFinding {
   sourceFiles: string[];
   high: number;
   critical: number;
+  /**
+   * v1.6.2: ehrliche Empfehlung statt pauschalem "Rebuild". Bei einem
+   * beweglichen Tag (`digestChanged === true`) zieht ein Rebuild einen neuen
+   * Digest; bei stabilem/unbekanntem Tag hilft nur ein neuer Tag.
+   */
+  digestChanged?: boolean;
+  digest?: string | null;
+  previousDigest?: string | null;
+}
+
+/**
+ * Empfehlungszeile für gepinnte Images mit CVEs (v1.6.2). Bisher stand hier
+ * pauschal "Rebuild/Base-Image aktualisieren" — bei einem unveränderlichen
+ * exakten Tag bringt ein Rebuild aber nichts (Owner-Feedback Prod-Report
+ * 2026-11-07).
+ */
+export function imageVulnAdvice(f: Pick<ImageVulnFinding, 'digestChanged'>): string {
+  return f.digestChanged
+    ? 'Tag beweglich, Rebuild zieht neuen Digest'
+    : 'Pin auf neueren Tag erhöhen (Rebuild hilft nicht)';
 }
 
 export interface Report {
@@ -187,6 +208,10 @@ export async function runScan(opts: {
 
   const results: RepoResult[] = [];
   const scanTmp = tmpRoot();
+  // Digest-Cache (v1.6.2): belegter Vergleich der Manifest-Digests je Ref
+  // (beweglicher Tag vs. unveränderlicher Pin). Wird erst NACH erfolgreichem
+  // Lauf geschrieben (wie state.json) — kein Write in finally.
+  const digestSession = openDigestSession();
 
   // Trivy-Verfügbarkeit EINMAL klären (lokal ohne Docker/Image eher fehlend)
   const trivyAvailable = await checkTrivy();
@@ -243,7 +268,7 @@ export async function runScan(opts: {
         // Image-Scan (v1.4.0): Dockerfiles/compose parsen → trivy image (ohne
         // daemon) + Freshness; optional Image-Tag-Bump-PR (nur pinned, immer-PR).
         try {
-          const img = await scanRepoImages(repo, repoDir, scanTmp, trivyAvailable);
+          const img = await scanRepoImages(repo, repoDir, scanTmp, trivyAvailable, digestSession);
           res.images = img.findings;
           if (opts.fixPrs && img.bumpPlan.length > 0) {
             res.imagePr = await createImagePr(repo, img.bumpPlan, state);
@@ -275,6 +300,10 @@ export async function runScan(opts: {
   } finally {
     fs.rmSync(scanTmp, { recursive: true, force: true });
   }
+
+  // Digest-Cache persistieren (90-Tage-Prune + Write), nur wenn der Lauf bis
+  // hierhin kam — Throws aus dem Loop landen gar nicht erst hier.
+  digestSession.save();
 
   const imageVulns = collectImageVulnFindings(results);
   const report: Report = {
@@ -341,6 +370,9 @@ export function collectImageVulnFindings(repos: RepoResult[]): ImageVulnFinding[
         sourceFiles: [...f.sourceFiles],
         high,
         critical,
+        digestChanged: f.digestChanged ?? false,
+        digest: f.digest ?? null,
+        previousDigest: f.previousDigest ?? null,
       });
     }
   }
@@ -749,6 +781,16 @@ function renderMarkdown(report: Report): string {
       lines.push('', `PR: ${rem.prUrl}`, '');
     }
   }
+  if (report.imageVulnFindings.length > 0) {
+    // 🛡-Sektion im MD-Report (v1.6.2): Base-Image-CVEs mit ehrlicher
+    // Empfehlung — Rebuild nur bei bewegtem Tag, sonst Pin auf neuen Tag.
+    lines.push('## 🛡 Image-Vulns (Base-Image)', '');
+    lines.push('| Repo | Image | Vulns H/C | Empfehlung |', '|---|---|---|---|');
+    for (const f of report.imageVulnFindings) {
+      lines.push(`| ${f.repo} | ${f.image} | H${f.high}/C${f.critical} | ${imageVulnAdvice(f)} |`);
+    }
+    lines.push('');
+  }
   for (const r of report.repos) {
     lines.push(`## ${r.name}${r.private ? ' (private)' : ''} — ${r.status}`);
     if (r.note) lines.push(`*Hinweis*: ${r.note}`);
@@ -829,9 +871,16 @@ function imageTable(images: ImageFinding[]): string {
       // slim → slim-bookworm). Kein Bump/PR — nur Sichtbarkeit im Report.
       rows.push(`| ${f.image} | ${f.current} | — | ${vc} | variant drift: ${f.variantDrift} |`);
     } else {
+      // v1.6.2: Digest-Vergleich belegt, ob ein Rebuild überhaupt etwas zieht.
+      const digestPart =
+        f.digestChanged === true
+          ? ' · Tag beweglich (Rebuild zieht neuen Digest)'
+          : '';
       rows.push(
         `| ${f.image} | ${f.current} | ${f.newestSameMajor ?? '—'} | ${vc} | ` +
-          (f.pinned ? 'aktuell' : 'floating (aktualisiert sich beim Rebuild)') + ' |'
+          (f.pinned
+            ? `pinned, aktuell${digestPart}`
+            : `floating (Rebuild${f.digestChanged === true ? ' zieht neuen Digest' : ' aktualisiert'})`) + ' |'
       );
     }
   }
@@ -923,9 +972,10 @@ export const IMAGE_VULN_TELEGRAM_MAX_LINES = 15;
  * 🛡-Sektion "Image-Vulns (Base-Image)" (v1.5.2): NUR die novel Image-Vulns
  * (neue H/C-Zahl je Repo+Image), gruppiert je Repo, gekappt auf
  * IMAGE_VULN_TELEGRAM_MAX_LINES Zeilen. Leer wenn keine novel Einträge.
+ * Empfehlung je Zeile (v1.6.2) aus imageVulnAdvice — kompakt (< 120 Zeichen).
  */
 export function imageVulnLines(
-  novel: Array<Pick<ImageVulnFinding, 'repo' | 'image' | 'high' | 'critical'>>
+  novel: Array<Pick<ImageVulnFinding, 'repo' | 'image' | 'high' | 'critical' | 'digestChanged'>>
 ): string[] {
   if (novel.length === 0) return [];
   const lines: string[] = [];
@@ -936,9 +986,10 @@ export function imageVulnLines(
     lines.push(`*${repo}*:`);
     for (const e of entries) {
       if (shown >= IMAGE_VULN_TELEGRAM_MAX_LINES) break;
-      lines.push(
-        `  • ${e.image} [H${e.high}/C${e.critical}] → Rebuild/Base-Image aktualisieren oder Fix-Version prüfen`
-      );
+      const advice = e.digestChanged === true
+        ? '→ Tag beweglich, Rebuild zieht neuen Digest'
+        : '→ Pin auf neueren Tag erhöhen (Rebuild hilft nicht)';
+      lines.push(trim(`  • ${e.image} [H${e.high}/C${e.critical}] ${advice}`, 120));
       shown++;
     }
     lines.push('');
@@ -952,7 +1003,7 @@ export function imageVulnLines(
 export function telegramBody(
   report: Report,
   hasNewFindings: boolean,
-  novelImageVulns: Array<Pick<ImageVulnFinding, 'repo' | 'image' | 'high' | 'critical'>> = []
+  novelImageVulns: Array<Pick<ImageVulnFinding, 'repo' | 'image' | 'high' | 'critical' | 'digestChanged'>> = []
 ): string {
   const lines: string[] = [];
   const totalCount = report.repos.reduce((n, r) => n + r.findings.length, 0);

@@ -1,6 +1,9 @@
 // CLI-Einstieg: audit-scanner [scan|inventory|test-telegram]
 
 import { CRON_SCHEDULE, fixPrsEnabled, log } from './config.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import semver from 'semver';
 import {
   newestExactTag,
@@ -19,6 +22,7 @@ import { llmEnabled, triageFindings, type TriageInput } from './llm.js';
 import {
   IMAGE_VULN_TELEGRAM_MAX_LINES,
   collectImageVulnFindings,
+  imageVulnAdvice,
   imageVulnLines,
   novelImageVulns,
   runScan,
@@ -38,6 +42,13 @@ import {
   type State,
 } from './state.js';
 import { sendTelegramReport } from './telegram.js';
+import {
+  loadDigestCache,
+  openDigestSession,
+  parseDigestCache,
+  pruneDigestCache,
+  type DigestCache,
+} from './digest-cache.js';
 
 function usage(): never {
   process.stdout.write(`audit-scanner — Nightly CVE-Scan der mayraost-Repos
@@ -67,6 +78,9 @@ COMMANDS
                 Entscheidungsfunktionen mit fixer Fake-Uhr — kein Netzwerk.
                 Prüft: 2d→too-young, 3d→eligible, CVE→sofort, Variant-Wechsel→
                 rejected, unbekanntes Datum→fail-open, stable→beta VERBOTEN.
+  digest-test   Digest-Cache (v1.6.2): korruptes digests.json → leerer Start,
+                erster/zweiter Lauf (stabil) vs. geänderter Digest (beweglicher
+                Tag), 90-Tage-Prune. Fake-Datei in tmp, kein Netzwerk.
 
 ENV
   GH_TOKEN            Pflicht (Bearer für api.github.com). Dev-Fallback lokal:
@@ -145,6 +159,12 @@ async function main(): Promise<void> {
       // Purer Selbsttest von Soaking + Pre-Release-Klassifikation (v1.6.0):
       // fixe Fake-Uhr, kein Netzwerk, kein Scan.
       process.exitCode = soakingTest();
+      return;
+    }
+    case 'digest-test': {
+      // Purer Selbsttest des Digest-Caches (v1.6.2): Fake-Datei in tmp,
+      // fixe Fake-Uhr, kein Netzwerk, kein Scan.
+      process.exitCode = digestTest();
       return;
     }
     case 'triage-test': {
@@ -529,8 +549,95 @@ function soakingTest(): number {
   return ok ? 0 : 1;
 }
 
-function imageVulnsTest(): number {  let ok = true;
-  const check = (label: string, cond: boolean): void => {
+/**
+ * Purer Selbsttest des Digest-Caches (v1.6.2, kein Netzwerk, kein Scan):
+ * 1) korruptes digests.json → leerer Cache, kein Crash.
+ * 2) erster Lauf setzt Digest + firstSeen; zweiter Lauf gleicher Digest →
+ *    digestChanged=false (stabiler Tag).
+ * 3) geänderter Digest → digestChanged=true + previousDigest (bewegl. Tag).
+ * 4) 91 Tage alter Eintrag wird geprunt, frischer bleibt.
+ * Zusätzlich: die Report-Empfehlung (imageVulnAdvice) klingt je Fall ehrlich.
+ * Die Fake-Datei liegt in einem tmp-Dir — die echte reports/digests.json
+ * wird nicht angefasst.
+ */
+function digestTest(): number {
+  let ok = true;
+  const check = (label: string, cond: boolean, detail = ''): void => {
+    process.stdout.write(`${cond ? 'OK  ' : 'FAIL'} ${label}${detail ? ` — ${detail}` : ''}\n`);
+    ok &&= cond;
+  };
+  const fakeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-test-'));
+  const file = path.join(fakeDir, 'digests.json');
+  const ref = 'node:26.13.0-alpine3.24';
+  const shaA = 'sha256:' + 'a'.repeat(64);
+  const shaB = 'sha256:' + 'b'.repeat(64);
+  const t0 = new Date('2026-11-07T12:00:00Z');
+  const at = (days: number): Date => new Date(t0.getTime() + days * 86_400_000);
+
+  try {
+    // 1) korruptes JSON → leerer Start ohne Crash
+    fs.writeFileSync(file, '{ nicht-json <<<');
+    const corrupt = loadDigestCache(file);
+    check('korruptes digests.json → leerer Cache', Object.keys(corrupt).length === 0, `entries=${Object.keys(corrupt).length}`);
+    check('parseDigestCache(garbage) = null', parseDigestCache('[]') === null);
+
+    // 2) erster Lauf → firstSeen; zweiter Lauf gleicher Digest → stabil
+    fs.writeFileSync(file, '{}\n');
+    const run1 = openDigestSession(t0, file);
+    const l1 = run1.lookup(ref, shaA);
+    run1.save();
+    const after1 = loadDigestCache(file);
+    check('lauf1 digest gesetzt', l1.digest === shaA && after1[ref]?.digest === shaA, `digest=${String(after1[ref]?.digest).slice(0, 20)}…`);
+    check('lauf1 firstSeen = jetzt', after1[ref]?.firstSeen === t0.toISOString(), after1[ref]?.firstSeen);
+    check('lauf1 digestChanged=false (erstes Mal gesehen)', l1.digestChanged === false && l1.previousDigest === null);
+
+    const run2 = openDigestSession(at(1), file);
+    const l2 = run2.lookup(ref, shaA);
+    run2.save();
+    const after2 = loadDigestCache(file);
+    check('lauf2 gleicher Digest → stabil', l2.digestChanged === false && l2.previousDigest === shaA);
+    check('lauf2 firstSeen unverändert, lastSeen nachgezogen',
+      after2[ref]?.firstSeen === t0.toISOString() && after2[ref]?.lastSeen === at(1).toISOString());
+    check('lauf2 keine neue Änderungshistorie', after2[ref]?.changes.length === 1, `changes=${after2[ref]?.changes.length}`);
+
+    // 3) geänderter Digest → beweglicher Tag
+    const run3 = openDigestSession(at(2), file);
+    const l3 = run3.lookup(ref, shaB);
+    run3.save();
+    const after3 = loadDigestCache(file);
+    check('lauf3 geänderter Digest → digestChanged=true', l3.digestChanged === true && l3.previousDigest === shaA);
+    check('lauf3 Historie wächst', after3[ref]?.changes.length === 2 && after3[ref]?.changes[1]?.digest === shaB);
+
+    // 3b) Lookup-Fehler (null) ist KEIN Wechsel
+    const run3b = openDigestSession(at(3), file);
+    const l3b = run3b.lookup(ref, null);
+    check('Lookup-Fehler → digestChanged=false, Digest bleibt', l3b.digestChanged === false && l3b.digest === null);
+
+    // 4) Prune: 91 Tage alte Ref fliegt raus, frische bleibt
+    const cache: DigestCache = {
+      'old:1.0.0': { digest: shaA, firstSeen: at(-120).toISOString(), lastSeen: at(-91).toISOString(), changes: [] },
+      'fresh:1.0.0': { digest: shaB, firstSeen: at(-5).toISOString(), lastSeen: at(-1).toISOString(), changes: [] },
+    };
+    const removed = pruneDigestCache(cache, t0);
+    check('prune entfernt 91-Tage-Eintrag', removed === 1 && !('old:1.0.0' in cache), `removed=${removed}`);
+    check('prune behält frischen Eintrag', 'fresh:1.0.0' in cache);
+
+    // 5) Report-Empfehlung klingt ehrlich je Fall
+    const moving = imageVulnAdvice({ digestChanged: true });
+    const stable = imageVulnAdvice({ digestChanged: false });
+    check('Empfehlung beweglicher Tag', /beweglich.*Rebuild/.test(moving), moving);
+    check('Empfehlung stabiler Tag (kein Rebuild-Rat)', /Pin auf neueren Tag/.test(stable) && !/Rebuild zieht/.test(stable), stable);
+    const line = imageVulnLines([{ repo: 'demo', image: ref, high: 6, critical: 0, digestChanged: false }]).find((l) => l.includes('•')) ?? '';
+    check('Telegram-Zeile ≤ 120 Zeichen', line.length > 0 && line.length <= 120, `${line.length} Zeichen`);
+  } finally {
+    fs.rmSync(fakeDir, { recursive: true, force: true });
+  }
+
+  process.stdout.write(ok ? './ digest-test PASS\n' : '✗ digest-test FAIL\n');
+  return ok ? 0 : 1;
+}
+
+function imageVulnsTest(): number {  let ok = true;  const check = (label: string, cond: boolean): void => {
     process.stdout.write(`${label}: ${cond ? 'OK' : 'FAIL'}\n`);
     ok &&= cond;
   };

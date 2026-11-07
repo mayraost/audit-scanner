@@ -5,8 +5,9 @@
 // - Je dedupliziertem Image-Ref: trivy image scan ohne Docker-Daemon
 //   (Registry-API direkt, gemeinsamer DB-Cache), HIGH/CRITICAL-Zählung;
 //   private/404-Images graceful skip mit Note.
-// - Freshness-Check via Registry-Tag-Liste (Docker Hub / GHCR, anonymous token
-//   flow); digest-pinned / latest / invalid Tags → Skip mit Note.
+// - Freshness-Check via Registry-Tag-Liste (Docker Hub / GHCR / MCR, anonymous
+//   token flow; MCR anonym ohne Auth-Header); digest-pinned / latest / invalid
+//   Tags → Skip mit Note.
 // - Fix-PR-Policy (v1.5.0, AGENTS.md "Keine floating versions"):
 //   a) EXAKT gepinnte Tags (x.y.z) mit neuerer Version im selben Major → PR-Bump
 //      auf den neueren exakten Tag.
@@ -27,13 +28,13 @@ import { OWNER, TRIVY_BIN, TRIVY_CACHE_DIR, log } from './config.js';
 import { b64, decodeB64, ghFetch, ghJson, ghJsonOrNull } from './github.js';
 import type { RepoInfo } from './inventory.js';
 import type { FixResult } from './fix-pr.js';
-import { imagePublishedAt } from './publish-dates.js';
+import { imageDigest, imagePublishedAt } from './publish-dates.js';
 import { updateEligibility, type Eligibility } from './soaking.js';
 import { upsertEntry, type State } from './state.js';
 
 const execFileP = promisify(execFile);
 
-export type Registry = 'docker-hub' | 'ghcr' | 'other';
+export type Registry = 'docker-hub' | 'ghcr' | 'mcr' | 'other';
 
 export interface ImageFinding {
   /** Image-Ref wie im File geschrieben (z. B. "aquasec/trivy:0.76.1"). */
@@ -74,6 +75,16 @@ export interface ImageFinding {
   eligibilityLabel?: string;
   /** v1.6.0: Alter des Kandidaten in Tagen. */
   ageDays?: number | null;
+  /** v1.6.2: Manifest-Digest des aktuellen Tags (null = Lookup fehlgeschlagen). */
+  digest?: string | null;
+  /** v1.6.2: Digest-Stand aus dem letzten Lauf (null = erstes Mal gesehen). */
+  previousDigest?: string | null;
+  /**
+   * v1.6.2: Tag ist BEWEGLICH — der Digest hat sich seit dem letzten Lauf
+   * geändert. Nur dann zieht ein Rebuild einen neuen Stand; bei stabilem Tag
+   * hilft nur ein neuer Tag (Empfehlung im Report/Telegram).
+   */
+  digestChanged?: boolean;
 }
 
 /** Bump-Plan (je File): literal `${base}:${oldTag}` → `${base}:${newTag}`. */
@@ -205,7 +216,8 @@ function parseCompose(lines: string[]): string[] {
   return out;
 }
 
-function splitRef(ref: string): { base: string; tag: string | null; digest: string | null; registry: Registry } {
+/** Ref-Zerlegung (exportiert für Debug-/Live-Proben; keine Signaturänderung). */
+export function splitRef(ref: string): { base: string; tag: string | null; digest: string | null; registry: Registry } {
   let rest = ref;
   let digest: string | null = null;
   const at = rest.indexOf('@');
@@ -218,8 +230,12 @@ function splitRef(ref: string): { base: string; tag: string | null; digest: stri
   const slash = rest.indexOf('/');
   const firstSeg = slash === -1 ? '' : rest.slice(0, slash);
   if (slash !== -1 && (firstSeg.includes('.') || firstSeg.includes(':') || firstSeg === 'localhost')) {
-    if (/^ghcr\.io$/i.test(firstSeg)) registry = 'ghcr';
-    else if (/^(docker\.io|index\.docker\.io|registry-1\.docker\.io)$/i.test(firstSeg)) registry = 'docker-hub';
+    // MCR (v1.6.2): Host case-insensitive, optionaler Port (`:443`) wird mit-
+    // getroffen — `base` behält nur den Repository-Pfad (`playwright/mcp`).
+    const host = firstSeg.replace(/:\d+$/, '').toLowerCase();
+    if (host === 'ghcr.io') registry = 'ghcr';
+    else if (/^(docker\.io|index\.docker\.io|registry-1\.docker\.io)$/.test(host)) registry = 'docker-hub';
+    else if (host === 'mcr.microsoft.com') registry = 'mcr';
     else registry = 'other';
     base = rest.slice(slash + 1);
   }
@@ -361,17 +377,33 @@ async function registryToken(base: string, registry: Registry): Promise<string |
     const j = (await res.json()) as { token?: string };
     return j.token ?? '';
   }
+  // MCR (v1.6.2): öffentliche Images anonym lesbar — `GET /v2/<repo>/tags/list`
+  // antwortet live mit 200 ohne Auth (kein `WWW-Authenticate`-Challenge).
+  // Leerer String = gültig, aber ohne Authorization-Header (siehe Fetch unten);
+  // null bleibt echte Fehler-Signatur.
+  if (registry === 'mcr') return '';
   return null;
 }
 
-/** Tags/list via Registry v2-API. 401/403 → null ('privat'), 404 → null. */
-async function fetchRegistryTags(base: string, registry: Registry): Promise<{ tags: string[] | null; note?: string }> {
-  if (registry === 'other') return { tags: null, note: 'Freshness nur Docker Hub/GHCR — übersprungen' };
+/**
+ * Tags/list via Registry v2-API. 401/403 → null ('privat'), 404 → null.
+ * Exportiert nur für `image-freshness-test`/Debug-Proben (keine Signaturänderung).
+ */
+export async function fetchRegistryTags(base: string, registry: Registry): Promise<{ tags: string[] | null; note?: string }> {
+  if (registry === 'other') return { tags: null, note: 'Freshness nur Docker Hub/GHCR/MCR — übersprungen' };
   try {
     const token = await registryToken(base, registry);
     if (token === null) return { tags: null, note: 'Token-Fetch fehlgeschlagen' };
     const repo = registry === 'docker-hub' && !base.includes('/') ? `library/${base}` : base;
-    const url = registry === 'docker-hub' ? `https://registry-1.docker.io/v2/${repo}/tags/list?n=1000` : `https://ghcr.io/v2/${base}/tags/list?n=1000`;
+    // MCR ignoriert `n` (live geprüft 2026-11-07: `?n=1000`, `?n=5` und ohne
+    // `n` liefern identisch alle Tags, kein Link-Header) — Query trotzdem
+    // gesetzt, Paging-Loop bleibt für andere Endpoints harmlos.
+    const url =
+      registry === 'docker-hub'
+        ? `https://registry-1.docker.io/v2/${repo}/tags/list?n=1000`
+        : registry === 'mcr'
+          ? `https://mcr.microsoft.com/v2/${base}/tags/list?n=1000`
+          : `https://ghcr.io/v2/${base}/tags/list?n=1000`;
     const out: string[] = [];
     let u: string | null = url;
     let depth = 0;
@@ -584,13 +616,19 @@ async function trivyImageScan(
 /**
  * Je Repo: Dockerfiles + Compose-Files parsen → Refs deduplizieren → trivy
  * image scan + Freshness je Ref (Konkurrenz 3). Bump-Plan nur für pinned
- * + strictly-newer same-major (PR-Kandidaten). Kein trivy → kein Image-Scan.
+ * + strictly-newer same-major (PR-Kandidaten).
+ *
+ * v1.6.2: `digests` (Digest-Cache-Session, optional) liefert den Manifest-
+ * Digest je Ref und erkennt einen beweglichen Tag (Digest-Wechsel seit dem
+ * letzten Lauf). Ohne Session bleibt der Scan unverändert.
+ * Kein trivy → kein Image-Scan.
  */
 export async function scanRepoImages(
   repo: RepoInfo,
   repoDir: string,
   scanTmp: string,
-  trivyAvailable: boolean
+  trivyAvailable: boolean,
+  digests?: { lookup: (imageRef: string, digest: string | null) => { digestChanged: boolean; previousDigest: string | null; digest: string | null } }
 ): Promise<ImageScanResult> {
   const files = findManifestFiles(repoDir);
   if (files.length === 0 || !trivyAvailable) return { findings: [], bumpPlan: [] };
@@ -632,6 +670,17 @@ export async function scanRepoImages(
     if (vulns.error) {
       f.note = vulns.error;
       continue;
+    }
+    // Digest-Vergleich (v1.6.2): belegt, ob der gepinnte Tag selbst BEWEGLICH
+    // ist (Digest seit dem letzten Lauf geändert → Rebuild zieht neuen Stand)
+    // oder ob nur ein neuer Tag hilft. Fehlt der Lookup → digest null, dann
+    // bleibt die Empfehlung konservativ ("Pin auf neueren Tag erhöhen").
+    if (digests) {
+      const d = await imageDigest(f.base, f.current, f.registry);
+      const t = digests.lookup(f.image, d.digest);
+      f.digest = t.digest;
+      f.previousDigest = t.previousDigest;
+      f.digestChanged = t.digestChanged;
     }
     if (f.digestPinned) continue; // Freshness bewusst übersprungen (digest satt)
     const { tags, note } = await fetchRegistryTags(f.base, f.registry);

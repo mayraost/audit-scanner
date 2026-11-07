@@ -109,12 +109,12 @@ async function pypiPublishedAt(pkg: string, version: string): Promise<PublishDat
 
 /**
  * Einheitlicher Einstieg für den Image-Scan. `registry` entscheidet die Quelle
- * (image-scan.splitRef liefert 'docker-hub' | 'ghcr' | 'other').
+ * (image-scan.splitRef liefert 'docker-hub' | 'ghcr' | 'mcr' | 'other').
  */
 export async function imagePublishedAt(
   base: string,
   tag: string,
-  registry: 'docker-hub' | 'ghcr' | 'other'
+  registry: 'docker-hub' | 'ghcr' | 'mcr' | 'other'
 ): Promise<PublishDateResult> {
   const key = `image|${registry}|${base}|${tag}`;
   const hit = cache.get(key);
@@ -124,6 +124,141 @@ export async function imagePublishedAt(
   else if (registry === 'ghcr') out = await ghcrPublishedAt(base, tag);
   else out = { publishedAt: null, note: 'Registry ohne Publish-Datum (fail-open)' };
   cache.set(key, out);
+  return out;
+}
+
+// ——————————————————————————— Manifest-Digest (v1.6.2) ———————————————————————————
+
+/**
+ * Registry-Kennung für den Digest-Lookup. Bewusst lokaler Typ (statt
+ * `Registry` aus image-scan.ts): er akzeptiert `'mcr'` bereits, auch wenn der
+ * Image-Scan seine Registry-Erkennung noch nicht erweitert hat — Aufrufer mit
+ * `Registry` übergeben den Wert kovariant und kompatibel.
+ */
+export type DigestRegistry = 'docker-hub' | 'ghcr' | 'mcr' | 'other';
+
+/** Ergebnis eines Digest-Lookups; `note` erklärt ein fehlendes Digest. */
+export interface ImageDigestResult {
+  digest: string | null;
+  note?: string;
+}
+
+/** OCI-/Docker-Manifest-Accepts (Index + Single-Manifest) für den HEAD-Call. */
+const MANIFEST_ACCEPT =
+  'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json';
+
+/** Cache pro Prozess: `registry|base|tag` → Ergebnis (Wechsel erkennt digest-cache.ts). */
+const digestCache = new Map<string, ImageDigestResult>();
+
+/** Docker-Hub-anonymous-Token (gleicher Flow wie registryToken in image-scan.ts). */
+async function dockerHubToken(repo: string): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull`,
+      { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) }
+    );
+    if (!res.ok) return null;
+    const j = (await res.json()) as { token?: string };
+    return j.token ?? '';
+  } catch {
+    return null;
+  }
+}
+
+/** GHCR-Token (anonymous pull scope). */
+async function ghcrToken(repo: string): Promise<string | null> {
+  try {
+    const res = await fetch(`https://ghcr.io/token?scope=repository:${repo}:pull`, {
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { token?: string };
+    return j.token ?? '';
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `Docker-Content-Digest` per HEAD auf `/v2/<repo>/manifests/<tag>`; wenn die
+ * Registry HEAD nicht beherrscht (405/501), GET mit `Accept`-Headern und
+ * ohne Body-Auswertung.
+ */
+async function manifestDigest(
+  url: string,
+  headers: Record<string, string>,
+  label: string
+): Promise<ImageDigestResult> {
+  const reqHeaders = { ...headers, Accept: MANIFEST_ACCEPT };
+  try {
+    let res = await fetch(url, {
+      method: 'HEAD',
+      headers: reqHeaders,
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    });
+    if (res.status === 405 || res.status === 501) {
+      res = await fetch(url, { method: 'GET', headers: reqHeaders, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+    }
+    if (res.status === 401 || res.status === 403) return { digest: null, note: `${label} nicht öffentlich (${res.status})` };
+    if (res.status === 404) return { digest: null, note: `${label} Manifest unbekannt (404)` };
+    if (!res.ok) return { digest: null, note: `${label} Manifest ${res.status}` };
+    const digest = res.headers.get('docker-content-digest');
+    return digest ? { digest } : { digest: null, note: `${label} ohne Docker-Content-Digest-Header` };
+  } catch (err) {
+    return {
+      digest: null,
+      note: `${label}-Fehler: ${err instanceof Error ? err.message.slice(0, 80) : '?'}`,
+    };
+  }
+}
+
+/**
+ * Manifest-Digest eines Registry-Tags (`Docker-Content-Digest`).
+ * Docker Hub/GHCR nutzen denselben anonymous Token-Flow wie
+ * `imagePublishedAt`; MCR antwortet anonymous auf Manifest-Calls (kein
+ * Auth-Header). `other` → keine Aussage (fail-open, digest null).
+ * Fehler nie werfen: `digest: null` + `note`.
+ */
+export async function imageDigest(
+  base: string,
+  tag: string,
+  registry: DigestRegistry
+): Promise<ImageDigestResult> {
+  const key = `digest|${registry}|${base}|${tag}`;
+  const hit = digestCache.get(key);
+  if (hit) return hit;
+  let out: ImageDigestResult;
+  if (registry === 'docker-hub') {
+    const repo = base.includes('/') ? base : `library/${base}`;
+    const token = await dockerHubToken(repo);
+    if (token === null) out = { digest: null, note: 'Docker-Hub-Token-Fetch fehlgeschlagen' };
+    else {
+      out = await manifestDigest(
+        `https://registry-1.docker.io/v2/${repo}/manifests/${encodeURIComponent(tag)}`,
+        token ? { Authorization: `Bearer ${token}` } : {},
+        'Docker-Hub'
+      );
+    }
+  } else if (registry === 'ghcr') {
+    const token = await ghcrToken(base);
+    if (token === null) out = { digest: null, note: 'GHCR-Token-Fetch fehlgeschlagen' };
+    else {
+      out = await manifestDigest(
+        `https://ghcr.io/v2/${base}/manifests/${encodeURIComponent(tag)}`,
+        token ? { Authorization: `Bearer ${token}` } : {},
+        'GHCR'
+      );
+    }
+  } else if (registry === 'mcr') {
+    out = await manifestDigest(
+      `https://mcr.microsoft.com/v2/${base}/manifests/${encodeURIComponent(tag)}`,
+      {},
+      'MCR'
+    );
+  } else {
+    out = { digest: null, note: 'Registry ohne Digest-Lookup (fail-open)' };
+  }
+  digestCache.set(key, out);
   return out;
 }
 
