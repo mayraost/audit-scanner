@@ -1,4 +1,4 @@
-// CLI-Einstieg: audit-scanner [scan|inventory|test-telegram]
+// CLI-Einstieg: audit-scanner [scan|inventory|test-telegram|notify-failure]
 
 import { CRON_SCHEDULE, fixPrsEnabled, log } from './config.js';
 import fs from 'node:fs';
@@ -52,6 +52,8 @@ import {
   type State,
 } from './state.js';
 import { sendTelegramReport } from './telegram.js';
+import { failureNotifyTest } from './failure-notify-test.js';
+import { notifyScanFailure, renderFailureMessage } from './failure-notify.js';
 import {
   loadDigestCache,
   openDigestSession,
@@ -74,6 +76,14 @@ COMMANDS
                 — Tages-Full-Report unangetastet; state/Telegram-Flow unverändert).
   inventory     Nur Inventarlisting (Repos + erkannte Manifests/Ökosysteme).
   test-telegram 1 Test-Nachricht via TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID senden.
+  notify-failure  Fehlschlag-Alarm (v1.7.4): Telegram-Nachricht "⚠️ CVE-Audit
+                FEHLGESCHLAGEN" mit rc, UTC-Zeitpunkt, Host + Log-Tail.
+                Aufruf aus bin/scan-wrapper.sh im else-Zweig:
+                  notify-failure --rc <rc> [--log <datei>]
+                Fehlende TELEGRAM_* ENV → Skip; Sende-Fehler → nur Warnung.
+                Exit-Code bleibt immer 0 (der Wrapper reicht den Scan-rc aus).
+  notify-failure-test  Render-Selbsttest des Fehlschlags-Alarms (rc/UTC/Host,
+                Tail-Kappung, Secret-Redaktion) — kein Netzwerk, kein Versand.
   triage-test   LLM-Triage mit 2 Fake-Findings prüfen (kein Scan, kein Telegram).
   state-test    PR-Dedupe-State: parse/reconciliation-Selbsttest mit simulierten Entries,
                 PR-Status-Check gegen mayraost/audit-scanner (Fake-Branch → kein offener
@@ -157,6 +167,45 @@ async function main(): Promise<void> {
     case 'test-telegram': {
       const ok = await sendTelegramReport('✅ audit-scanner Test-Report', body());
       process.exitCode = ok ? 0 : 2;
+      return;
+    }
+    case 'notify-failure': {
+      // Ausfall-Alarm (v1.7.4), aus bin/scan-wrapper.sh im else-Zweig. Bewusst
+      // IMMER exit 0: der Wrapper reicht den Original-rc des Scans weiter, ein
+      // kaputter Telegram-Versand darf den echten Fehler nicht überdecken.
+      const args = process.argv.slice(3);
+      const flag = (name: string): string | undefined => {
+        const i = args.indexOf(`--${name}`);
+        return i >= 0 ? args[i + 1] : undefined;
+      };
+      const rcArg = flag('rc') ?? null;
+      const logArg = flag('log') ?? '';
+      // Log-Tail: fehlende/unlesbare Datei ist kein Fehler → Platzhalter.
+      let logText = '';
+      if (logArg) {
+        try {
+          logText = fs.readFileSync(logArg, 'utf8');
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          log(`WARN: Fehlschlag-Alarm: Log ${logArg} nicht lesbar (${m}) — Tail entfällt.`);
+        }
+      }
+      const details = { rc: rcArg, logText };
+      if (process.env.NOTIFY_FAILURE_DRY_RUN === '1') {
+        // Verifikation ohne Produktions-Chat: gerenderten Text auf stderr
+        // ausgeben statt senden (keine KI, kein Netzwerk).
+        process.stderr.write(`${renderFailureMessage(details)}\n`);
+        return;
+      }
+      // False (ENV fehlt / Senden fehlgeschlagen) ist ok — notifyScanFailure
+      // loggt selbst und wirft nie.
+      await notifyScanFailure(details);
+      return;
+    }
+    case 'notify-failure-test': {
+      // Purer Render-Selbsttest des Fehlschlag-Alarms (v1.7.4): kein Netzwerk,
+      // kein Telegram-Versand, kein Scan.
+      process.exitCode = failureNotifyTest();
       return;
     }
     case 'state-test': {

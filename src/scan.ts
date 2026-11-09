@@ -969,8 +969,14 @@ async function sendTelegramFromReport(report: Report, state: State, fixPrs: bool
     report.repos.some((r) => r.imagePr?.status === 'created');
   const hasReminders = report.reminders.length > 0 || report.pinsReminders.length > 0;
   if (!hasNew && !hasReminders) {
-    // Keine neuen Funde UND keine offenen Fix-PRs → gar kein Versand (kein Spam).
-    log('Telegram skip: keine neuen Findings und keine offenen Fix-PRs — kein Versand.');
+    // Keine neuen Funde UND keine offenen Fix-PRs → Tages-Quittung statt Stille.
+    // Vorfall 08./09.11.2026: bei Stille sind "nichts gefunden" und "Scan
+    // abgestürzt" für den Empfänger ununterscheidbar. Seit v1.7.4 kommt daher
+    // JEDEN Tag eine Meldung; fehlt sie, ist wirklich etwas kaputt.
+    const title = `✅ CVE-Audit ${date} (mayraost)`;
+    const body = telegramAllClear(report);
+    const sent = await sendTelegramReport(title, body);
+    if (sent) log('Telegram: Tages-Quittung gesendet (keine Findings, keine offenen Fix-PRs).');
     return;
   }
   const title = `🔐 CVE-Audit ${date} (mayraost)`;
@@ -1046,6 +1052,36 @@ export function imageVulnLines(
   if (rest > 0) lines.push(`  … +${rest} weitere (Report)`);
   while (lines.at(-1) === '') lines.pop();
   return lines;
+}
+
+/**
+ * Tages-Quittung für Läufe ohne neue Findings und ohne offene Fix-PRs (v1.7.4).
+ * Bewusst kurz: der Nutzer soll auf einen Blick sehen, dass der Scanner lief
+ * und sauber war — nicht einen weiteren Report lesen. Die Zahl der gescannten
+ * Repos und die übersprungenen Repos stehen mit drin, weil "0 Findings" bei
+ * 0 gescannten Repos etwas anderes bedeutet als bei 8.
+ */
+export function telegramAllClear(report: Report): string {
+  const lines: string[] = [];
+  lines.push('*Keine neuen Findings, keine offenen Fix-PRs.*');
+  lines.push('');
+  lines.push(`Repos: ${report.summary.scanned}/${report.summary.reposTotal} gescannt`);
+  lines.push(`Unpinned Deps: ${report.summary.unpinned} · API-Calls: ${report.summary.apiCalls}`);
+  const iv = report.summary.imageVulns;
+  if (iv.images > 0) {
+    lines.push(
+      `Base-Images: ${iv.images} geprüft (H${iv.high}/C${iv.critical} — alt/ohne neueren Tag, nicht alarmiert)`
+    );
+  }
+  // Nur echte Ausfälle nennen — 'skipped-no-manifest'/'skipped-archived' sind normal.
+  const abnormal = report.repos.filter((r) => r.status === 'error' || r.status === 'skipped-env');
+  if (abnormal.length > 0) {
+    lines.push('');
+    lines.push(`⚠️ Nicht gescannt: ${abnormal.map((r) => r.name).join(', ')}`);
+  }
+  lines.push('');
+  lines.push('_Nächster Lauf: morgen 16:00._');
+  return lines.join('\n');
 }
 
 export function telegramBody(

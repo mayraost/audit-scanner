@@ -471,7 +471,7 @@ node dist/index.js image-freshness-test # Variant-Matching/Freshness (kein Netz)
 
 Achtung: `scan` ist ein echter Lauf (Trivy-Downloads, API-Calls, bei
 `ENABLE_FIX_PRS=1` echte PRs). Zum Testen ohne Nebenwirkungen nur `inventory`,
-`triage-test` oder `state-test` nutzen.
+`triage-test`, `notify-failure-test` oder `state-test` nutzen.
 
 **Manueller Container-Trigger** (laufende App, kein Deploy nötig). Der
 Container-Name ändert sich pro Deploy:
@@ -485,6 +485,17 @@ docker exec -d <container> sh -c 'sh /app/bin/scan-wrapper.sh >> /app/logs/scan.
 roh.** Der Wrapper (`bin/scan-wrapper.sh`) macht Log-Rotate + Heartbeat-Touch;
 der Redirect muss **im Container** passieren (`sh -c '… >> …'`), nicht auf dem
 Host — bei `docker exec -d` verwirft Docker sonst den Output.
+
+**Fehlschlag-Alarm:** Endet der Scan mit rc ≠ 0, ruft der Wrapper
+`node /app/dist/index.js notify-failure --rc <rc> --log /app/logs/scan.log` auf
+→ Telegram `⚠️ CVE-Audit FEHLGESCHLAGEN <datum>` mit rc, UTC-Zeitpunkt,
+Host/Container und den letzten 15 Log-Zeilen (gekürzt + Token-redigiert).
+Ohne `TELEGRAM_*`-ENV wird still übersprungen; ein Sende-Fehler ändert den
+Exit-Code des Wrappers **nicht**. Der Heartbeat wird nur im Erfolgsfall
+getoucht — blieb der Lauf lang genug aus, flippt der HEALTHCHECK nach 48 h
+auf `unhealthy`. Rendering-Test offline: `npm run notify-failure-test`;
+Trockenlauf ohne Versand: `NOTIFY_FAILURE_DRY_RUN=1 node dist/index.js
+notify-failure --rc 1 --log /tmp/x.log`.
 
 Status/Log nach dem Lauf:
 
