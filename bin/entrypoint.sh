@@ -21,7 +21,9 @@ mkdir -p "$CRON_DIR" "$LOG_DIR" "$REPORTS_DIR" "$CACHE_DIR/trivy" 2>/dev/null ||
 # Boot-Touch: Heartbeat atmungsfrisch setzen, damit HEALTHCHECK nicht sofort failt.
 # Herzschlag-Updates passieren später als node (crond-Job) → Volumen-Files bleiben node-owned.
 touch "$REPORTS_DIR/.heartbeat"
-chown node:node "$REPORTS_DIR/.heartbeat" "$REPORTS_DIR" "$LOG_DIR" 2>/dev/null || true
+# -R recursive: einzelne Volume-Files (z. B. digests.json) können von einem
+# root-Prozess stammen → sonst EACCES im node-Cron-Job (Vorfall 08./09.11.2026).
+chown -R node:node "$REPORTS_DIR" "$LOG_DIR" "$CACHE_DIR" 2>/dev/null || true
 
 # busybox crond liest eine Crontab-Datei je user im Crontab-Dir; Nutzername =
 # Dateiname. Hier als root geschrieben → File ist root-owned (Pflicht fürs Laden).

@@ -173,10 +173,27 @@ export function pruneDigestCache(
   return removed;
 }
 
-/** digests.json persistieren (Volume, nur der Scanner schreibt; nicht atomar nötig). */
-export function saveDigestCache(cache: DigestCache, file = digestCachePath()): void {
-  ensureDir(path.dirname(file));
-  fs.writeFileSync(file, JSON.stringify(cache, null, 2) + '\n');
+/**
+ * digests.json persistieren (Volume, nur der Scanner schreibt; nicht atomar nötig).
+ *
+ * Fehlertolerant (Bug 09.11.2026): der Cache ist reine Historie für Drift-
+ * Erkennung — ein Schreibfehler (z. B. Volume-File mit falschem Owner, EACCES)
+ * darf NIE den gesamten Lauf abbrechen. Vorher starb der Scan hier VOR
+ * Report-Write und Telegram-Versand, d. h. zwei Nächte ohne Meldung.
+ * Rückgabe: true = geschrieben, false = übersprungen (Warnung geloggt).
+ */
+export function saveDigestCache(cache: DigestCache, file = digestCachePath()): boolean {
+  try {
+    ensureDir(path.dirname(file));
+    fs.writeFileSync(file, JSON.stringify(cache, null, 2) + '\n');
+    return true;
+  } catch (err) {
+    log(
+      `digests.json konnte nicht geschrieben werden (${file}): ${(err as Error).message} — ` +
+        `Lauf läuft weiter, Digests werden beim nächsten Lauf neu aufgebaut.`
+    );
+    return false;
+  }
 }
 
 /**
@@ -189,7 +206,7 @@ export interface DigestSession {
   /** belegter Digest + Wechsel gegenüber dem Stand vor diesem Lauf. */
   lookup(imageRef: string, digest: string | null): { digestChanged: boolean; previousDigest: string | null; digest: string | null };
   /** 90-Tage-Prune + Write (nur nach erfolgreichem Scan-Lauf aufrufen). */
-  save(): void;
+  save(): boolean;
 }
 
 export function openDigestSession(now: Date = new Date(), file = digestCachePath()): DigestSession {
@@ -204,7 +221,7 @@ export function openDigestSession(now: Date = new Date(), file = digestCachePath
     save() {
       const removed = pruneDigestCache(cache, now);
       if (removed > 0) log(`digests.json: ${removed} Eintrag/Einträge älter als ${PRUNE_AFTER_DAYS} Tage entfernt.`);
-      saveDigestCache(cache, file);
+      return saveDigestCache(cache, file);
     },
   };
 }
