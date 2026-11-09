@@ -88,6 +88,13 @@ export interface FailureDetails {
   at?: string;
   /** Hostname; Default = os.hostname(). */
   hostname?: string;
+  /**
+   * Kurzgrund des Ausfalls (v1.7.5). Default = "scan beendet mit rc=<rc>".
+   * Für den trap-Pfad im Wrapper: der Prozess wurde abgebrochen, OHNE dass der
+   * Scanner einen rc geliefert hat (OOM-Kill, SIGTERM beim Deploy-Rollover,
+   * SIGKILL nach Timeout) — dann stimmt "scan beendet mit rc=N" nicht.
+   */
+  reason?: string;
 }
 
 /** Titelzeile — bewusst unterscheidbar vom Erfolgsreport (`🔐 CVE-Audit <datum>`). */
@@ -103,9 +110,15 @@ export function renderFailureMessage(d: FailureDetails): string {
   const at = d.at ?? new Date().toISOString();
   const rc = d.rc === null || d.rc === '' ? 'unbekannt' : String(d.rc);
   const host = trim(d.hostname ?? os.hostname(), 80);
-  const reason = `scan beendet mit rc=${rc}`;
+  const reason = d.reason ? trim(d.reason, 160) : `scan beendet mit rc=${rc}`;
+  // Die Report-Aussage gilt nur fürs normale Scheitern. Beim Abbruch (trap)
+  // wissen wir nicht, ob überhaupt ein Report geschrieben wurde — dann offen
+  // formulieren statt etwas Falsches zu behaupten.
+  const headline = d.reason
+    ? 'Der nächtliche CVE-Audit-Lauf wurde ABGEBROCHEN.'
+    : 'Der nächtliche CVE-Scan ist FEHLGESCHLAGEN — es liegt KEIN Report vor.';
   return [
-    'Der nächtliche CVE-Scan ist FEHLGESCHLAGEN — es liegt KEIN Report vor.',
+    headline,
     `Exit-Code: ${rc}`,
     `Zeitpunkt (UTC): ${at}`,
     `Container/Host: ${host}`,

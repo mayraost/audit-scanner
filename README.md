@@ -497,6 +497,16 @@ auf `unhealthy`. Rendering-Test offline: `npm run notify-failure-test`;
 Trockenlauf ohne Versand: `NOTIFY_FAILURE_DRY_RUN=1 node dist/index.js
 notify-failure --rc 1 --log /tmp/x.log`.
 
+**Abbruch-Absicherung (v1.7.5):** Bis v1.7.4 meldete nur der `else`-Zweig einen
+Fehlschlag. Starb der Wrapper selbst — OOM-Kill, SIGTERM beim Deploy-Rollover,
+SIGKILL nach Timeout — wurde er nie erreicht, der Ausfall blieb still. Jetzt
+liegt ein `trap` auf `EXIT HUP INT TERM` im Wrapper: endet er ohne
+quittierenden rc-Pfad, geht ein Alarm mit `--reason "… abgebrochen …"` raus
+(andere Formulierung als der normale Fehlschlag, weil hier nicht feststeht, ob
+überhaupt ein Report geschrieben wurde). Doppelmeldungen verhindert das
+Merker-File `logs/.failure-alarm-sent`, das zu Beginn jedes Laufs gelöscht und
+von Erfolg **oder** Fehlschlag-Pfad gesetzt wird.
+
 Status/Log nach dem Lauf:
 
 ```sh

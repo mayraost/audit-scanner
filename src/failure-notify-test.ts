@@ -85,6 +85,19 @@ export function failureNotifyTest(): number {
   check(`Nachricht < ${TELEGRAM_MAX} Zeichen (Worst Case)`, worst.length < TELEGRAM_MAX, `${worst.length} Zeichen`);
   check('unbekannter rc wird benannt', renderFailureMessage({ rc: null, logText: '', at }).includes('Exit-Code: unbekannt'));
 
+  // 7) Abbruch-Variante (v1.7.5, trap-Pfad): eigener Wortlaut, kein „KEIN Report"
+  const aborted = renderFailureMessage({
+    rc: 143,
+    logText: 'x',
+    at,
+    reason: 'Lauf abgebrochen (Signal)',
+  });
+  check('Abbruch: sagt ABGEBROCHEN', aborted.includes('ABGEBROCHEN'));
+  check('Abbruch: behauptet NICHT "KEIN Report"', !aborted.includes('KEIN Report'));
+  check('Abbruch: Grund enthalten', aborted.includes('Lauf abgebrochen'));
+  // Ohne --reason muss weiterhin der normale Fehlschlag-Text kommen.
+  check('ohne --reason: alte Formulierung', renderFailureMessage({ rc: 1, logText: '', at }).includes('FEHLGESCHLAGEN'));
+
   process.stdout.write(ok ? './ notify-failure-test PASS\n' : '✗ notify-failure-test FAIL\n');
   return ok ? 0 : 1;
 }

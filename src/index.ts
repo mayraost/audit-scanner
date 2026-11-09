@@ -82,6 +82,10 @@ COMMANDS
                   notify-failure --rc <rc> [--log <datei>]
                 Fehlende TELEGRAM_* ENV → Skip; Sende-Fehler → nur Warnung.
                 Exit-Code bleibt immer 0 (der Wrapper reicht den Scan-rc aus).
+  notify-failure --reason <text>
+                (v1.7.5) Abbruch-Variante für den trap-Pfad: kein rc vorhanden
+                (OOM-Kill, SIGTERM beim Deploy-Rollover) → eigene Formulierung
+                "wurde ABGEBROCHEN" statt "es liegt KEIN Report vor".
   notify-failure-test  Render-Selbsttest des Fehlschlags-Alarms (rc/UTC/Host,
                 Tail-Kappung, Secret-Redaktion) — kein Netzwerk, kein Versand.
   triage-test   LLM-Triage mit 2 Fake-Findings prüfen (kein Scan, kein Telegram).
@@ -190,7 +194,7 @@ async function main(): Promise<void> {
           log(`WARN: Fehlschlag-Alarm: Log ${logArg} nicht lesbar (${m}) — Tail entfällt.`);
         }
       }
-      const details = { rc: rcArg, logText };
+      const details = { rc: rcArg, logText, reason: flag('reason') };
       if (process.env.NOTIFY_FAILURE_DRY_RUN === '1') {
         // Verifikation ohne Produktions-Chat: gerenderten Text auf stderr
         // ausgeben statt senden (keine KI, kein Netzwerk).
