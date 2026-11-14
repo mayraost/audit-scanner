@@ -455,6 +455,7 @@ Lokal ohne Docker braucht ein voller `scan` zusätzlich `trivy` im PATH.
 | `ENABLE_RENOVATE` | nein | `0` | `1` = Renovate-CLI als **Analyse-Quelle** mitlaufen lassen. Renovate legt **nie** eigene PRs an; seine Vorschläge landen gebündelt im `cve-audit/pins-<datum>`-PR. |
 | `RENOVATE_BIN` | nein | `renovate` | Pfad zum Renovate-Binary (im Image global installiert, exakt gepinnt). |
 | `RENOVATE_TIMEOUT_MS` | nein | `120000` | Timeout je Repo für den Renovate-Lauf (`--dry-run=lookup`). Timeout/Exit≠0 ⇒ Repo ohne Renovate-Vorschläge, Pinning-Scan läuft weiter. |
+| `NODE_OPTIONS` | nein | `--report-on-signal --report-signal=SIGSEGV --report-directory=/app/logs` | **Crash-Diagnose** (v1.7.7): Node schreibt bei SIGSEGV einen Diagnose-Report nach `/app/logs/report.<datum>.<pid>.<seq>.json` (header.event, JS-Heap, native Frames, Env, libuv-Handles). Nur `--report-on-signal` ohne `--report-signal` installiert **keinen** Handler — der Report bleibt dann aus. Leer setzen (`NODE_OPTIONS=`) schaltet die Diagnose ab. |
 
 **Item-Level-Skip**: Datei `.cve-audit-skip` im Repo-Root (wird im Inventar
 erkannt; Repo erscheint als `skip(repo-file)`). **`SKIP_REPOS`** klammert Repos
@@ -613,6 +614,7 @@ Kompakte Release-Historie (git history; Version in package.json):
 | v1.7.4 | Fehlschlag-Alarm per Telegram (`notify-failure`) + Tages-Quittung |
 | v1.7.5 | `trap`-Absicherung: auch stummer Abbruch (Signal/OOM/Timeout) meldet |
 | v1.7.6 | Telegram-Retry (3×, 1 s/3 s/7 s) + Alarm-Merker erst nach Erfolg; HEALTHCHECK 26 h statt 48 h |
+| v1.7.7 | Crash-Diagnose: `NODE_OPTIONS=--report-on-signal --report-signal=SIGSEGV` → Diagnose-Report in `/app/logs` |
 
 ## Tests & Sicherheit
 

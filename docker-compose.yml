@@ -17,6 +17,14 @@ services:
       DEEPINFRA_API_KEY: ${DEEPINFRA_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-zai-org/GLM-5.3-Flash}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepinfra.com/v1/openai}
+      # Crash-Diagnose (v1.7.7, Vorfall 14.11.2026: node starb mit SIGSEGV,
+      # rc=139, ohne jeden Anhaltspunkt). Node schreibt beim Signal einen
+      # Diagnose-Report (header.event, JS-Heap, native Frames, Env, libuv)
+      # nach /app/logs/report.<datum>.<pid>.<seq>.json.
+      # ACHTUNG: --report-on-signal allein installiert KEINEN Handler — ohne
+      # explizites --report-signal bleibt der Report aus (SIGUSR2 ist nur der
+      # Default-Wert, nicht der Auslöser).
+      NODE_OPTIONS: "${NODE_OPTIONS:---report-on-signal --report-signal=SIGSEGV --report-directory=/app/logs}"
       # Cron in Container-Zeit (TZ=Europe/Berlin im Image): 16:00 Ortszeit.
       CRON_SCHEDULE: ${CRON_SCHEDULE:-0 16 * * *}
       # Soaking: Updates erst nach N Tagen (Package-Poisoning-Schutz). 0 = aus.
