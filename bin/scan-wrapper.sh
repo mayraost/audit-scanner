@@ -36,13 +36,21 @@ send_alarm() {
   if [ -f "$ALARM_MARKER" ]; then
     return 0
   fi
-  : > "$ALARM_MARKER" 2>/dev/null || true
   if [ -n "$sa_reason" ]; then
-    node /app/dist/index.js notify-failure --rc "$sa_rc" --log "$SCAN_LOG" --reason "$sa_reason" \
-      || echo "WARN: notify-failure selbst fehlgeschlagen (rc=$sa_rc bleibt)."
+    node /app/dist/index.js notify-failure --rc "$sa_rc" --log "$SCAN_LOG" --reason "$sa_reason"
   else
-    node /app/dist/index.js notify-failure --rc "$sa_rc" --log "$SCAN_LOG" \
-      || echo "WARN: notify-failure selbst fehlgeschlagen (rc=$sa_rc bleibt)."
+    node /app/dist/index.js notify-failure --rc "$sa_rc" --log "$SCAN_LOG"
+  fi
+  sa_gesendet=$?
+  # Merker NUR bei erfolgreichem Versand setzen (v1.7.6, Vorfall 14.11.2026):
+  # vorher wurde er VOR dem Senden gesetzt — ein einziger "fetch failed" beim
+  # Versand machte den Alarm damit endgueltig stumm (trap unterdrueckt, kein
+  # zweiter Versuch). Jetzt bleibt der Merker offen, der EXIT-trap wiederholt
+  # den Versand einmal (inkl. der 3 Retries in telegram.ts).
+  if [ "$sa_gesendet" = "0" ]; then
+    : > "$ALARM_MARKER" 2>/dev/null || true
+  else
+    echo "WARN: notify-failure fehlgeschlagen (rc=$sa_gesendet) — Merker bleibt offen, trap wiederholt einmal."
   fi
   return 0
 }
@@ -78,9 +86,10 @@ echo "=== scan start $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
 # Telegram-Meldung "⚠️ CVE-Audit FEHLGESCHLAGEN" raus (Formatierung + Versand
 # in TypeScript, src/failure-notify.ts). Der Merker + `rc`-Weiterreichung
 # stellen sicher, dass ein kaputter Telegram-Versand den echten Exit-Code
-# NICHT überdeckt.
+# NICHT überdeckt. Seit v1.7.6 wird der Merker erst NACH erfolgreichem Versand
+# gesetzt — ein gescheiterter Alarm wird vom EXIT-trap einmal wiederholt.
 # Der Heartbeat bleibt im Fehlerfall bewusst unangetastet — erst dann flippt
-# der HEALTHCHECK nach 48 h ohne Erfolgslauf auf unhealthy.
+# der HEALTHCHECK nach 26 h ohne Erfolgslauf auf unhealthy.
 if node /app/dist/index.js scan; then
   touch "$REPORTS_DIR/.heartbeat"
   # Erfolg quittiert den Alarm-Merker, damit der EXIT-trap nicht feuert.

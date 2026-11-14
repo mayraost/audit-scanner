@@ -1,5 +1,8 @@
 // Telegram-Notify (Spec §6): sendMessage via Bot-API.
 // - Lim 4096/Messagelimit → chunked split('\n\n') bei 4000, 300ms Pause (429-Mitigierung)
+// - Retry (v1.7.6): 3 Versuche mit 1s/3s/7s Pause bei Netz-/5xx-Fehlern
+//   (4xx = Konfig, kein Retry) — Vorfall 14.11.2026: ein "fetch failed" hat
+//   den Fehlschlag-Alarm verschluckt.
 // - Default plain text (Spec-Empfehlung: MarkdownV2-Escaping fehleranfällig);
 //   MarkdownV2 optional via TELEGRAM_PARSE_MODE=MarkdownV2 inkl. korrekter Escapes.
 // - Secrets (GH_TOKEN, Tokens, any payload content) gehen NIE in die Message.
@@ -65,6 +68,39 @@ async function sendMessageOnce(text: string): Promise<void> {
 }
 
 /**
+ * Netz-/Server-Fehler sind voruebergehend (Vorfall 14.11.2026: ein einzelner
+ * "fetch failed" beim Fehlschlag-Alarm hat die Meldung verloren). Deshalb:
+ * bis zu drei Versuche mit wachsender Pause. 4xx (Token, Chat-ID, Payload)
+ * wird nicht wiederholt — das ist Konfig, kein Zufall.
+ */
+const PAUSEN_MS = [1000, 3000, 7000];
+
+function istVoruebergehend(err: unknown): boolean {
+  const m = err instanceof Error ? err.message : String(err);
+  if (/fetch failed|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|EPIPE|UND_EPIPE_CLOSED/i.test(m)) {
+    return true;
+  }
+  const status = Number(/Telegram sendMessage (\d{3})/.exec(m)?.[1] ?? 0);
+  return status >= 500;
+}
+
+async function sendMitWiederholung(text: string): Promise<void> {
+  for (let versuch = 0; ; versuch++) {
+    try {
+      return await sendMessageOnce(text);
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      const pause = PAUSEN_MS[versuch];
+      if (!istVoruebergehend(err) || pause === undefined) throw err;
+      log(
+        `WARN: Telegram-Versand Versuch ${versuch + 1} fehlgeschlagen (${m}) — Wiederholung in ${pause} ms.`
+      );
+      await sleep(pause);
+    }
+  }
+}
+
+/**
  * Text senden (chunked + geringe Rate). Wenn ENV fehlt: ein Log + OK (scan läuft weiter).
  */
 export async function sendTelegramReport(title: string, body: string): Promise<boolean> {
@@ -80,11 +116,11 @@ export async function sendTelegramReport(title: string, body: string): Promise<b
     const piece = pieces[i] as string;
     const msg = TELEGRAM_PARSE_MODE === 'MarkdownV2' ? escapeMarkdownV2(piece) : piece;
     try {
-      await sendMessageOnce(msg);
+      await sendMitWiederholung(msg);
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err);
       log(`WARN: Telegram-Senden (chunk ${i + 1}/${pieces.length}) fehlgeschlagen: ${m}`);
-      if (i === 0) return false; // kaputte Bot-Config → nichts weiter spammen
+      if (i === 0) return false; // nach 3 Versuchen immer noch kaputt → nichts weiter spammen
       // spätere Chunks: weitermachen, Fehler sind transient sequenziell — aber nicht crashen
       continue;
     }

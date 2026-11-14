@@ -42,6 +42,9 @@ RUN mkdir -p /app/reports /app/logs /app/.cache/trivy /app/crontabs /app/tmp \
 # non-root: Files werden still ignoriert UND Jobs sterben an setgroups(EPERM).
 # Bug-Quelle vor 02.11.2026: unter `USER node` feuerte der 16:00-Cron nie.
 # Container-Root ist hier ausdrücklich nur für crond; Scanner-Job läuft als node.
+# Healthcheck (v1.7.6): 26 h statt 48 h — ein einzelner verpasster Nachtlauf
+# soll den Container noch am Folgetag auf `unhealthy` drehen (Coolify meldet
+# Status-Wechsel per Telegram). Tageslauf = 24 h, 2 h Puffer.
 HEALTHCHECK --interval=15m --timeout=10s --start-period=2m --retries=3 \
-  CMD test $(( $(date +%s) - $(stat -c %Y /app/reports/.heartbeat 2>/dev/null || echo 0) )) -lt 172800
+  CMD test $(( $(date +%s) - $(stat -c %Y /app/reports/.heartbeat 2>/dev/null || echo 0) )) -lt 93600
 ENTRYPOINT ["/bin/sh", "/app/bin/entrypoint.sh"]

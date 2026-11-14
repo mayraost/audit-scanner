@@ -46,10 +46,33 @@ n=$(wc -l < "$CALLS")
 [ "$n" = "1" ] && ok "Fehler: genau 1 Alarm (kein Doppel durch trap)" || no "Fehler: $n Alarme"
 [ -f "$ROOT/reports/.heartbeat" ] && no "Fehler: Heartbeat wurde gesetzt" || ok "Fehler: Heartbeat unangetastet"
 
-# 3) notify-failure scheitert: Scan-rc bleibt
+# 3) notify-failure scheitert dauerhaft: Scan-rc bleibt, trap wiederholt einmal
 setup
 NODE_SCAN_RC=7 NODE_NOTIFY_RC=5 PATH="$ROOT/bin:$PATH" "$ROOT/wrap.sh" >/dev/null 2>&1; rc=$?
 [ "$rc" = "7" ] && ok "notify kaputt: Scan-rc=7 bleibt" || no "notify kaputt: rc=$rc (erwartet 7)"
+n=$(wc -l < "$CALLS")
+[ "$n" = "2" ] && ok "notify kaputt: 2 Versuche (Haupt + trap)" || no "notify kaputt: $n Versuche (erwartet 2)"
+[ -f "$ROOT/logs/.failure-alarm-sent" ] && no "notify kaputt: Merker trotzdem gesetzt" || ok "notify kaputt: Merker offen"
+
+# 3b) notify-failure scheitert EINMAL, trap-Versuch klappt: Merker wird gesetzt
+setup
+cat > "$ROOT/bin/node" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *"index.js scan") echo "[fake] scan scheitert"; exit 7 ;;
+  *" notify-failure "*)
+    echo "NOTIFY $(printf '%s' "$*" | sed 's#.*notify-failure ##')" >> "$CALLS"
+    if [ -f "$CALLS.flaky" ]; then exit 0; fi
+    : > "$CALLS.flaky"; exit 5 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$ROOT/bin/node"
+PATH="$ROOT/bin:$PATH" "$ROOT/wrap.sh" >/dev/null 2>&1; rc=$?
+[ "$rc" = "7" ] && ok "notify flaky: Scan-rc=7 bleibt" || no "notify flaky: rc=$rc (erwartet 7)"
+n=$(wc -l < "$CALLS")
+[ "$n" = "2" ] && ok "notify flaky: 2 Versuche" || no "notify flaky: $n Versuche (erwartet 2)"
+[ -f "$ROOT/logs/.failure-alarm-sent" ] && ok "notify flaky: Merker nach Erfolg gesetzt" || no "notify flaky: Merker fehlt"
 
 # 4) SIGTERM an den Wrapper: Alarm MIT Abbruch-Grund
 setup

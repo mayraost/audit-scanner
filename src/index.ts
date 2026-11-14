@@ -215,8 +215,11 @@ async function main(): Promise<void> {
         return;
       }
       // False (ENV fehlt / Senden fehlgeschlagen) ist ok — notifyScanFailure
-      // loggt selbst und wirft nie.
-      await notifyScanFailure(details);
+      // loggt selbst und wirft nie. Der Exit-Code 1 ist das Signal an den
+      // Wrapper (v1.7.6): Alarm NICHT raus → Merker bleibt offen, der trap
+      // wiederholt den Versand einmal. Der Scan-rc bleibt davon unberuehrt.
+      const gesendet = await notifyScanFailure(details);
+      if (!gesendet) process.exitCode = 1;
       return;
     }
     case 'notify-failure-test': {

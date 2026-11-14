@@ -29,7 +29,7 @@ keine Ports, keine Domain, reiner Batch-Job.
 - Auto-Fix-PRs (opt-in) für CVE-, Image- und Pins-Befunde
 - Report als `report.json`/`report.md`, neuer Tag je Tag-Verzeichnis
 - Telegram-Notify (nur bei neuen Findings oder offenen PRs)
-- Heartbeat + Docker-HEALTHCHECK (frisch getoucht < 48 h)
+- Heartbeat + Docker-HEALTHCHECK (frisch getoucht < 26 h)
 
 ## Inhaltsverzeichnis
 
@@ -93,7 +93,7 @@ Pipeline je Nachtlauf (bzw. manueller Trigger):
 8. **Optional Auto-Fix-PRs**: je nach Befund `cve`-, `image`- oder `pins`-PR
    (Details in den folgenden Abschnitten).
 9. **Report + Heartbeat**: `reports/<YYYY-MM-DD>/report.json` und `report.md`;
-   `.heartbeat` wird getoucht (HEALTHCHECK akzeptiert Alter < 48 h).
+   `.heartbeat` wird getoucht (HEALTHCHECK akzeptiert Alter < 26 h).
 10. **Telegram**: Nachricht nur, wenn **neue Findings** vorliegen **oder**
     offene CVE/Pins-PRs existieren (Reminder-Sektion zuerst, danach nur neue
     Findings; nur Reminders → kompakte Kurznachricht). „Neue Findings“ umfasst
@@ -515,9 +515,19 @@ Host — bei `docker exec -d` verwirft Docker sonst den Output.
 → Telegram `⚠️ CVE-Audit FEHLGESCHLAGEN <datum>` mit rc, UTC-Zeitpunkt,
 Host/Container und den letzten 15 Log-Zeilen (gekürzt + Token-redigiert).
 Ohne `TELEGRAM_*`-ENV wird still übersprungen; ein Sende-Fehler ändert den
-Exit-Code des Wrappers **nicht**. Der Heartbeat wird nur im Erfolgsfall
-getoucht — blieb der Lauf lang genug aus, flippt der HEALTHCHECK nach 48 h
-auf `unhealthy`. Rendering-Test offline: `npm run notify-failure-test`;
+Exit-Code des Wrappers **nicht**.
+
+**Versand-Retry (v1.7.6, Vorfall 14.11.2026):** Ein einzelner transienter
+`fetch failed` hatte den Alarm komplett verschluckt (ein Versuch, kein Retry,
+Merker trotzdem gesetzt). Jetzt: `sendMessageOnce` wird bis zu **3×** versucht
+(1 s/3 s/7 s Pause) bei Netz-Fehlern und 5xx; 4xx (Token, Chat-ID, Payload)
+bricht sofort ab. `notify-failure` signalisiert einen gescheiterten Versand per
+Exit-Code 1 → der Wrapper setzt den Merker erst **nach** Erfolg und der
+`EXIT`-trap wiederholt den Versand einmal.
+
+Der Heartbeat wird nur im Erfolgsfall getoucht — blieb der Lauf lang genug aus,
+flippt der HEALTHCHECK nach 26 h auf `unhealthy` (Coolify meldet den
+Status-Wechsel per Telegram). Rendering-Test offline: `npm run notify-failure-test`;
 Trockenlauf ohne Versand: `NOTIFY_FAILURE_DRY_RUN=1 node dist/index.js
 notify-failure --rc 1 --log /tmp/x.log`.
 
@@ -529,7 +539,9 @@ quittierenden rc-Pfad, geht ein Alarm mit `--reason "… abgebrochen …"` raus
 (andere Formulierung als der normale Fehlschlag, weil hier nicht feststeht, ob
 überhaupt ein Report geschrieben wurde). Doppelmeldungen verhindert das
 Merker-File `logs/.failure-alarm-sent`, das zu Beginn jedes Laufs gelöscht und
-von Erfolg **oder** Fehlschlag-Pfad gesetzt wird.
+von Erfolg **oder** erfolgreich versendetem Fehlschlag-Alarm gesetzt wird
+(seit v1.7.6 erst nach dem Versand — ein gescheiterter Versand lässt den
+`EXIT`-trap einmal wiederholen).
 
 Status/Log nach dem Lauf:
 
@@ -554,7 +566,10 @@ Reports liegen unter **`/app/reports/<YYYY-MM-DD>/`** (untagged Drafts in
    `tzdata` für TZ-Auflösung, `dist` + prod-node_modules + `bin/`.
 
 - **HEALTHCHECK** heartbeat-age-basiert: `interval 15m`, Fail wenn
-  `.heartbeat` älter als 48 h (`test $(( $(date +%s) - $(stat -c %Y .heartbeat) )) -lt 172800`).
+  `.heartbeat` älter als 26 h (`test $(( $(date +%s) - $(stat -c %Y .heartbeat) )) -lt 93600`).
+  Seit v1.7.6 bewusst 26 h statt 48 h: ein einzelner verpasster Nachtlauf
+  dreht den Container am Folgetag auf `unhealthy` (Coolify-Status-Wechsel →
+  Telegram), statt erst nach zwei Tagen.
   entrypoint touched den Heartbeat boot-seitig, damit keine False-Fails beim Start.
 - **crond als PID 1** — **WICHTIG**: crond läuft als **root**. Busybox-crond
   lädt Crontab-Files nur bei `st_uid == 0` (`crond.c:440, DAEMON_UID`) und
@@ -595,6 +610,9 @@ Kompakte Release-Historie (git history; Version in package.json):
 | v1.7.0 | Renovate als Analyse-Quelle; Lockfile-Regen fail-closed |
 | v1.7.1 | Registry-Tag-Präfix beim Release-Check (trivy `v0.76.2` vs `0.76.2`) |
 | v1.7.2 | Deploybare Pins-PRs: kein `[skip ci]`, peer-aware Pins, Lockfile alles-oder-nichts + Draft-Warnung, Quay im Release-Check, `pinning-test` |
+| v1.7.4 | Fehlschlag-Alarm per Telegram (`notify-failure`) + Tages-Quittung |
+| v1.7.5 | `trap`-Absicherung: auch stummer Abbruch (Signal/OOM/Timeout) meldet |
+| v1.7.6 | Telegram-Retry (3×, 1 s/3 s/7 s) + Alarm-Merker erst nach Erfolg; HEALTHCHECK 26 h statt 48 h |
 
 ## Tests & Sicherheit
 
