@@ -343,11 +343,6 @@ function betaCandidate(
 }
 
 /**
- * Pinning-Scan je Repo: alle package.json (ohne node_modules) parsen, floating
- * deps sammeln, je pkg latest bestimmen. Der Pr-RepoDir-Checkout ist bereits
- * entpackt (scan.ts ruft das nach downloadTarball).
- */
-/**
  * Renovate-Kandidaten (v1.7.0) in PinFinding überführen.
  *
  * Arbeitsteilung: der Pinning-Scanner findet FLOATING Specs (`^1.2.3`),
@@ -363,10 +358,34 @@ export function renovateToPinFindings(
   candidates: RenovateCandidate[],
   findings: PinFinding[]
 ): PinFinding[] {
+  return mapRenovateCandidates(candidates, findings, (c) =>
+    path.posix.join(...path.relative(repoDir, path.join(repoDir, c.packageFile)).split(path.sep))
+  );
+}
+
+/**
+ * Server-Variante ohne Checkout: `packageFile` aus dem Renovate-Log ist bereits
+ * repo-relativ (`--platform=local` mit cwd = Repo-Root). Verhalten identisch zu
+ * `renovateToPinFindings` — Tests nutzen diese Form (kein tmp-Repo nötig).
+ */
+export function renovateCandidatesToPinFindings(
+  candidates: RenovateCandidate[],
+  findings: PinFinding[]
+): PinFinding[] {
+  return mapRenovateCandidates(candidates, findings, (c) =>
+    path.posix.normalize(c.packageFile).replace(/^\.\//, '')
+  );
+}
+
+function mapRenovateCandidates(
+  candidates: RenovateCandidate[],
+  findings: PinFinding[],
+  manifestRel: (c: RenovateCandidate) => string
+): PinFinding[] {
   const out: PinFinding[] = [];
   const seen = new Set(findings.map((f) => `${f.manifestPath}|${f.pkg}`));
   for (const c of candidates) {
-    const rel = path.posix.join(...path.relative(repoDir, path.join(repoDir, c.packageFile)).split(path.sep));
+    const rel = manifestRel(c);
     const key = `${rel}|${c.depName}`;
     if (seen.has(key)) continue; // schon als floating Pin erfasst → keine Doppelmeldung
     seen.add(key);
@@ -391,6 +410,7 @@ export function renovateToPinFindings(
   }
   return out;
 }
+
 // ———————————————— v1.7.2: Peer-Awareness beim Pinnen (Defekt 2) ——————————————
 //
 // Beleg 2026-11-07 (private-ai-interface): der Scanner pinnte `graphql` blind auf

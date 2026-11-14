@@ -25,7 +25,7 @@ import path from 'node:path';
 import semver from 'semver';
 
 import type { PinDeps, PinFinding, GhFile } from './pinning.js';
-import { createPinsPr, effectiveVersion, peerConflictLabel, peerGate } from './pinning.js';
+import { createPinsPr, effectiveVersion, peerConflictLabel, peerGate, renovateCandidatesToPinFindings } from './pinning.js';
 import { isBelievable, registryTagCandidates, type ManifestProbe } from './release-check.js';
 import { splitRef } from './image-scan.js';
 import type { RepoInfo } from './inventory.js';
@@ -342,6 +342,117 @@ export async function pinningTest(): Promise<number> {
   );
   check('D4 Notizen/Tags: v2.13.0 flippt (Quay/MCR-Muster)', registryTagCandidates('v2.13.0').join('|') === 'v2.13.0|2.13.0');
   check('D4 Nicht-Versions-Tag bleibt verbatim', registryTagCandidates('main-20261101').join('|') === 'main-20261101');
+
+  // ————————————— D5: Lockfile-Abdeckung (Owner-Anforderung v1.7.0) —————————————
+  // Kern-Regel: JEDER PR mit Manifest-Änderung muss das abdeckende Lockfile
+  // mit-schreiben. Root-Manifest → root-Lockfile; Monorepo-Nested-Manifest →
+  // Workspace-Root-Lockfile; kein abdeckendes Lockfile → fail-closed.
+  {
+    // (a) Manifest im Repo-Root + package-lock.json → Lockfile wird mitgeändert
+    const regenCalls: Array<{ eco: string; lockContent: string }> = [];
+    const { rec } = await runPr(
+      {
+        files: { 'package.json': PKG, 'package-lock.json': LOCK },
+        regen: (lockContent) => {
+          regenCalls.push({ eco: 'npm', lockContent });
+          return { content: LOCK.replace('{}', '{"lodash":"4.18.1"}') };
+        },
+      },
+      [finding('lodash', '^4.17.0', '4.18.1')]
+    );
+    check(
+      'D5a Root-Manifest: Lockfile + Manifest committet',
+      rec.puts.some((p) => p.path === 'package-lock.json') && rec.puts.some((p) => p.path === 'package.json'),
+      rec.puts.map((p) => p.path).join(',')
+    );
+    check('D5a Root-Manifest: Regen mit root-package-lock.json gefüttert', regenCalls.length === 1 && regenCalls[0]?.lockContent === LOCK);
+  }
+
+  {
+    // (b) Monorepo: apps/web/package.json + package-lock.json im ROOT mit
+    //     `workspaces` → zuständig ist das ROOT-Lockfile, nicht ein Fehlschlag.
+    const mono = { workspaces: ['apps/*'], dependencies: {} } as Record<string, unknown>;
+    const webPkg = `${JSON.stringify({ name: 'web', dependencies: { react: '18.2.0' } }, null, 2)}\n`;
+    const fed: string[] = [];
+    const { rec, result } = await runPr(
+      {
+        files: {
+          'package.json': `${JSON.stringify(mono, null, 2)}\n`,
+          'package-lock.json': LOCK,
+          'apps/web/package.json': webPkg,
+        },
+        regen: (lockContent) => {
+          fed.push(lockContent);
+          return { content: LOCK.replace('{}', '{"react":"18.3.1"}') };
+        },
+      },
+      [finding('react', '18.2.0', '18.3.1', { manifestPath: 'apps/web/package.json' })]
+    );
+    const touched = rec.puts.map((p) => p.path);
+    check(
+      'D5b Monorepo: Nested-Manifest ändert das ROOT-Lockfile mit',
+      touched.join(',') === 'package-lock.json,apps/web/package.json',
+      touched.join(',') || '—'
+    );
+    check('D5b Monorepo: Regen lief gegen root-package-lock.json', fed.length === 1 && fed[0] === LOCK);
+    check('D5b Monorepo: kein Draft (kein Skip-Grund)', result.status === 'created' && rec.prDrafts[0] === false, `${result.status} draft=${rec.prDrafts[0]}`);
+  }
+
+  {
+    // (c) Manifest ohne abdeckendes Lockfile → Kandidat ausgeschlossen, PR
+    //     (Draft) nur mit dem Rest — nie ein PR mit unverändertem Lockfile.
+    const webPkg = `${JSON.stringify({ name: 'web', dependencies: { react: '18.2.0' } }, null, 2)}\n`;
+    const { rec, result } = await runPr(
+      {
+        files: {
+          // Root ohne `workspaces` → root-Lockfile deckt apps/web NICHT ab.
+          'package.json': `${JSON.stringify({ name: 'root', dependencies: { lodash: '^4.17.0' } }, null, 2)}\n`,
+          'package-lock.json': LOCK,
+          'apps/web/package.json': webPkg,
+        },
+        regen: () => ({ content: `${LOCK} ` }),
+      },
+      [
+        finding('lodash', '^4.17.0', '4.18.1'),
+        finding('react', '18.2.0', '18.3.1', { manifestPath: 'apps/web/package.json' }),
+      ]
+    );
+    const touched = rec.puts.map((p) => p.path);
+    check('D5c kein abdeckendes Lockfile → Nested-Manifest NICHT committet', !touched.includes('apps/web/package.json'), touched.join(','));
+    check('D5c Rest des PRs bleibt (Root-Manifest + Lockfile)', touched.join(',') === 'package-lock.json,package.json', touched.join(','));
+    const body = rec.prBodies[0] ?? '';
+    check('D5c PR-Body: NOT applied + kein abdeckendes Lockfile', /NOT applied/.test(body) && /react/.test(body), body.split('\n').find((l) => /react/.test(l)) ?? '—');
+    check('D5c PR ist Draft', result.status === 'created' && rec.prDrafts[0] === true, `${result.status} draft=${rec.prDrafts[0]}`);
+  }
+
+  {
+    // (d) Renovate-Kandidat + Pinning-Kandidat landen im SELBEN PR, und der
+    //     Lockfile-Regen deckt beide ab (Renovate-Ziel exakt gepinnt → Bump).
+    const pkg = `${JSON.stringify({ name: 'demo', dependencies: { lodash: '^4.17.0', semver: '7.6.0' } }, null, 2)}\n`;
+    const renovate = [
+      {
+        packageFile: 'package.json',
+        depName: 'semver',
+        depType: 'dependencies',
+        currentValue: '7.6.0',
+        newVersion: '7.8.6',
+        updateType: 'minor',
+        releaseTimestamp: '2026-11-02T17:05:43.359Z',
+        ageDays: 5,
+        isBreaking: false,
+      },
+    ];
+    const renFindings = renovateCandidatesToPinFindings(renovate, []);
+    check('D5d Renovate-Kandidat → PinFinding (exakt, minor)', renFindings.length === 1 && renFindings[0]?.pkg === 'semver' && renFindings[0]?.majorOrBreaking === false);
+    const { rec, result } = await runPr(
+      { files: { 'package.json': pkg, 'package-lock.json': LOCK }, regen: () => ({ content: `${LOCK} ` }) },
+      [...renFindings, finding('lodash', '^4.17.0', '4.18.1')]
+    );
+    const manifest = rec.puts.find((p) => p.path === 'package.json')?.content ?? '';
+    check('D5d beide Bumps in EINEM package.json-Commit', /"lodash": "4\.18\.1"/.test(manifest) && /"semver": "7\.8\.6"/.test(manifest));
+    check('D5d Lockfile im selben PR regeneriert', rec.puts.some((p) => p.path === 'package-lock.json'), rec.puts.map((p) => p.path).join(','));
+    check('D5d ein PR für beide Quellen', result.status === 'created' && rec.prBodies.length === 1);
+  }
 
   // ————————————————————————— Manifest-Version in der Sandbox —————————————————————————
   // (nur als Guard: die Fixtures müssen semver-gültig bleiben)

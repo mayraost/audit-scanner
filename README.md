@@ -360,9 +360,30 @@ Renovate-Branches. Major-/Breaking-Updates erscheinen nur im Report (`Src:
 rnv (major)`) und werden **nie** automatisch gebumpt.
 
 **Installation:** Renovate liegt als separat gepinnte CLI im Image
-(`npm i -g renovate@44.222.1`), **nicht** in der `package.json` — das Paket ist
-AGPL-3.0-only und zieht ~124 transitive Dependencies mit, was unsere eigene
-Pins-Policy ad absurdum führen würde. Einschalten mit `ENABLE_RENOVATE=1`.
+(`RUN npm i -g renovate@44.222.1 && ln -sf …/dist/renovate.js /usr/local/bin/renovate`),
+**nicht** in unserer `package.json` — das Paket ist AGPL-3.0-only und zieht ~124
+transitive Dependencies mit, was unsere eigene Pins-Policy ad absurdum führen
+würde. Die Stage bringt zusätzlich `git` mit (`--platform=local` arbeitet auf
+einem echten Checkout; reines `lookup` ohne Branch-Erzeugung).
+
+Image-Kosten (geschätzt, **keine** Messung): `npm i -g` im Runner legt
+`/usr/local/lib/node_modules/renovate` + Deps ab — Renovate nennt sich selbst
+mit 15,4 MB entpackt, npm zieht rund 400 MB `node_modules` (u. a. `re2`
+inclusive Build 99 MB, `@aws-sdk` 54 MB) abzüglich der Build-Artefakte von
+`re2`; netto realistisch **+250 bis +450 MB** auf einem Runner, der heute bei
+~300 MB liegt (also grob 2×). Der Bin wird per Symlink nach `/usr/local/bin`
+gelegt; `NODE_PATH` ist nicht nötig, weil `dist/renovate.js` seine Deps relativ
+zum globalen `node_modules` auflöst. Läuft laut `engines` (`^24.11.0 ||
+^26.13.0`) auf der Node-26-Basis.
+
+**Ausgabe-Parsing:** `--log-format=json` gibt es in 44.222.1 nicht; die
+JSONL-Ausgabe kommt über Env `LOG_FORMAT=json` + `LOG_LEVEL=debug`. Die
+Update-Daten liegen im Log-Objekt `msg: "packageFiles with updates"` unter
+`config` (Map manager → `packageFiles[]`), nicht unter `packageFiles`.
+`minimumReleaseAge` wird aus `UPDATE_MIN_AGE_DAYS` abgeleitet — eine Regelquelle.
+Timeout je Repo 120 s (`RENOVATE_TIMEOUT_MS`); Fehler/Timeout → stiller Fallback
+auf den Pinning-Scanner, nie ein Abbruch des Laufs. Einschalten mit
+`ENABLE_RENOVATE=1`.
 
 **Lockfile-Pflicht (fail-closed):** Ein PR, der `package.json` ändert, aber das
 Lockfile unangetastet lässt, bricht `npm ci`. Deshalb ermittelt
@@ -433,6 +454,7 @@ Lokal ohne Docker braucht ein voller `scan` zusätzlich `trivy` im PATH.
 | `SHOW_EXOTIC_PRERELEASES` | nein | `0` | `1` = Nightly/Canary/Dev/Insiders-Kandidaten zusätzlich im Report zeigen (Default aus, Rauschkontrolle). |
 | `ENABLE_RENOVATE` | nein | `0` | `1` = Renovate-CLI als **Analyse-Quelle** mitlaufen lassen. Renovate legt **nie** eigene PRs an; seine Vorschläge landen gebündelt im `cve-audit/pins-<datum>`-PR. |
 | `RENOVATE_BIN` | nein | `renovate` | Pfad zum Renovate-Binary (im Image global installiert, exakt gepinnt). |
+| `RENOVATE_TIMEOUT_MS` | nein | `120000` | Timeout je Repo für den Renovate-Lauf (`--dry-run=lookup`). Timeout/Exit≠0 ⇒ Repo ohne Renovate-Vorschläge, Pinning-Scan läuft weiter. |
 
 **Item-Level-Skip**: Datei `.cve-audit-skip` im Repo-Root (wird im Inventar
 erkannt; Repo erscheint als `skip(repo-file)`). **`SKIP_REPOS`** klammert Repos
@@ -467,6 +489,8 @@ node dist/index.js triage-test  # LLM-Triage mit 2 Fake-Findings (kein Scan/Tele
 node dist/index.js state-test   # State-Dedupe-Selbsttest (simuliert, Fake-Branch)
 node dist/index.js image-vulns-test # Image-Vuln-Novelty-Selbsttest (synthetisch)
 node dist/index.js image-freshness-test # Variant-Matching/Freshness (kein Netz)
+node dist/index.js pinning-test  # Pins-PR-Qualität (Fakes, kein Netz)
+node dist/index.js renovate-test # Renovate-Parser + Lockfile-Abdeckung (Fakes)
 ```
 
 Achtung: `scan` ist ein echter Lauf (Trivy-Downloads, API-Calls, bei
@@ -590,6 +614,15 @@ Kompakte Release-Historie (git history; Version in package.json):
   (Draft + `⚠️ NOT applied`), Lockfile-Commit vor Manifest-Commit, keine
   `[skip ci]`-Marker, Image-Tag-Präfix-Flip für Docker Hub/MCR/Quay und
   „kein Image" nur bei belastbarer Probe.
+- `renovate-test` (v1.7.0) — Renovate-Analyse **offline**: eingebettetes
+  JSONL-Fixture in der echten Log-Form (`msg: "packageFiles with updates"`,
+  Update-Daten unter `config`) prüft Parser (nur deps mit `updates[]`, höchste
+  `newVersion` je dep, `releaseTimestamp`/`ageDays`), kaputten/leeren Output
+  (`ok:false` ohne Crash), Major-Guard (`major`/`isBreaking` nie im PR) und die
+  Lockfile-Abdeckung: Root-Manifest → `package-lock.json` mit-committet,
+  Monorepo-Nested-Manifest → Workspace-Root-Lockfile, kein abdeckendes
+  Lockfile → Kandidat fail-closed ausgeschlossen (Draft + `⚠️ NOT applied`),
+  Renovate- und Pinning-Kandidat landen im **selben** PR.
 - `image-vulns-test` — synthetische Report-/State-Objekte: Legacy-`state.json`
   ohne `imageVulns`-Feld parst, Novelty-Regel (erster Lauf / unverändert /
   geänderte H/C-Zahl) und Telegram-🛡-Sektion inkl. 15-Zeilen-Kappung.

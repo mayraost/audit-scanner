@@ -52,6 +52,7 @@ import {
   type State,
 } from './state.js';
 import { sendTelegramReport } from './telegram.js';
+import { pinningTest } from './pinning-test.js';
 import { failureNotifyTest } from './failure-notify-test.js';
 import { notifyScanFailure, renderFailureMessage } from './failure-notify.js';
 import {
@@ -115,6 +116,14 @@ COMMANDS
                 Regen-Fehler → kein Manifest-Commit im PR (fail-closed, Draft +
                 ⚠️), kein [skip ci] in Commit-Messages, Image-Tag-Präfix-Flip
                 (Docker Hub/MCR/Quay). Kein Netz, kein PR, kein Telegram.
+  renovate-test Renovate-Analyse (v1.7.0) OFFLINE: eingebettetes JSONL-Fixture
+                in echter Log-Form (msg = "packageFiles with updates", Daten
+                unter config). Prüft Parser (höchste newVersion je dep,
+                Alter), kaputten Output (ok:false ohne Crash), Major-Guard
+                (major/isBreaking nie fixable) sowie Lockfile-Abdeckung
+                (Root-Lockfile, Monorepo-Workspace-Root, fail-closed ohne
+                Lockfile) und den gebündelten PR (Pinning + Renovate zusammen).
+                Kein Renovate-Aufruf, kein Netz, kein PR.
 
 ENV
   GH_TOKEN            Pflicht (Bearer für api.github.com). Dev-Fallback lokal:
@@ -125,6 +134,10 @@ ENV
   SKIP_REPOS          Kommagetrennte Repo-Skip-Liste.
   CRON_SCHEDULE       cron-String für busybox crond (Standard: ${CRON_SCHEDULE} UTC).
   TRIVY_BIN           trivy-Pfad (Standard: trivy im PATH).
+  ENABLE_RENOVATE     "1" aktiviert die Renovate-Analyse (Standard: aus). Renovate
+                      legt nie eigene PRs an — Vorschläge landen im Pins-PR.
+  RENOVATE_BIN        Renovate-Pfad (Standard: renovate im PATH).
+  RENOVATE_TIMEOUT_MS Timeout je Repo für den Renovate-Lauf (Standard: 120000).
   DEEPINFRA_API_KEY   LLM-Triage + LLM-PR-Bodies (optional; fehlt → "LLM disabled").
   LLM_MODEL           Default: zai-org/GLM-5.3-Flash.
   LLM_BASE_URL        Default: https://api.deepinfra.com/v1/openai.
@@ -249,7 +262,6 @@ async function main(): Promise<void> {
     case 'pinning-test': {
       // Pins-PR-Qualität (v1.7.2): Fake-Registry/GitHub/Regen injiziert,
       // kein Netzwerk, kein PR, kein Telegram.
-      const { pinningTest } = await import('./pinning-test.js');
       process.exitCode = await pinningTest();
       return;
     }

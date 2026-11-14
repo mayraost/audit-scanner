@@ -20,6 +20,7 @@
     "digest-test": "node dist/index.js digest-test",
     "release-version-test": "node dist/index.js release-version-test",
     "pinning-test": "node dist/index.js pinning-test",
+    "renovate-test": "node dist/index.js renovate-test",
     "wrapper-test": "sh test/scan-wrapper-test.sh"
   },
   "dependencies": {
