@@ -848,20 +848,24 @@ function renderMarkdown(report: Report): string {
 /** 📌-Sektion je Repo (Report-MD): floating npm-Specifier (v1.5.0 Enforcement). */
 function pinningTable(pins: PinFinding[]): string {
   const rows = pins.map((p) => {
-    // v1.6.0: Soaking-Status (reif / zu jung) + Beta-Hinweis (nur Info).
+    // v1.6.0/v1.8.0: Soaking-Status (reif / zu jung) + Beta-Kanal-Ziel.
     const soak = p.eligibility
       ? eligibilityBadge({ eligibility: p.eligibility, ageDays: p.ageDays ?? null, label: p.eligibilityLabel ?? '' })
       : '—';
-    const beta = p.prereleaseHint
-      ? `ℹ️ ${p.prereleaseHint} (${p.prereleaseLabel ?? '?'})`
+    // v1.8.0: Beta-Kanal hat ein echtes Ziel — beta → beta oder beta → stable.
+    const betaTarget = p.betaPin && p.pinTarget ? p.pinTarget : p.prereleaseHint ?? null;
+    const beta = betaTarget
+      ? `${betaTarget} (${
+          p.betaPin && p.pinTargetKind === 'stable' ? 'beta → stable' : 'beta → beta'
+        }, ${p.eligibilityLabel ?? p.prereleaseLabel ?? '?'})`
       : '—';
     // v1.7.0: Quelle sichtbar machen (floating-Pin vs. Renovate-Analyse).
     const src = p.source === 'renovate' ? (p.majorOrBreaking ? 'rnv (major)' : 'renovate') : 'pin';
     return `| ${p.pkg} | ${p.current} | ${p.latest ?? '—'} | ${p.section} | ${p.severity} | ${soak} | ${beta} | ${src} |`;
   });
   return [
-    '### 📌 Unpinned deps (package.json) — Floating-Specifier',
-    '| Package | Current | Latest exact | Scope | Sev | Soaking | Beta/RC | Src |',
+    '### 📌 Unpinned deps (package.json) — Floating-Specifier + Beta-Kanal',
+    '| Package | Current | Latest exact | Scope | Sev | Soaking | Beta/RC-Ziel | Src |',
     '|---|---|---|---|---|---|---|---|',
     ...rows,
   ].join('\n');
@@ -1013,7 +1017,11 @@ function reminderLines(report: Report): string[] {
   }
   // Pins-PRs NACH der CVE-Reminder-Sektion, eigener Zeilentyp (kein ⏰-Mix).
   for (const rem of report.pinsReminders) {
-    lines.push(`📌 Pins-PR offen (floating deps): *${rem.repo}* → ${rem.prUrl} (seit ${rem.ageDays} Tagen)`);
+    const repo = report.repos.find((r) => r.name === rem.repo);
+    const hasBeta = (repo?.pins ?? []).some((p) => p.betaPin && p.pinTarget);
+    lines.push(
+      `📌 Pins-PR offen (${hasBeta ? 'floating deps + beta' : 'floating deps'}): *${rem.repo}* → ${rem.prUrl} (seit ${rem.ageDays} Tagen)`
+    );
   }
   if (lines.length > 0 && lines.at(-1) === '') lines.pop();
   return lines;
@@ -1169,18 +1177,20 @@ export function telegramBody(
       lines.push('');
     }
   }
-  // ℹ️ Beta-Hinweise (v1.6.0, N2): NUR für Pakete, die bereits auf einem
-  // Beta/RC-Kanal liegen — keine "es gibt eine Beta"-Werbung für stabile Pakete.
-  // Zusätzlich muss der Kandidat die Soaking-Reife haben (kein Rauschen).
+  // ℹ️ Beta-Kanal-Updates (v1.8.0): NUR für Pakete, die bereits auf einem
+  // Beta/RC-Kanal liegen — stabile Pakete bekommen KEINEN Beta-Hinweis. Das
+  // Ziel ist ein echtes Update (beta → beta oder beta → stable) und landet im
+  // Pins-PR. Zusätzlich muss der Kandidat die Soaking-Reife haben.
   const betaLines: string[] = [];
   for (const r of report.repos) {
     const betas = (r.pins ?? []).filter(
-      (p) => p.prereleaseHint && p.prereleaseEligibility === 'eligible'
+      (p) => p.betaPin && p.pinTarget && p.eligibility === 'eligible'
     );
     if (betas.length === 0) continue;
     betaLines.push(`*${r.name}*:`);
     for (const p of betas) {
-      betaLines.push(`  • ${p.pkg} ${p.current} → ${p.prereleaseHint} (${p.prereleaseLabel ?? '?'})`);
+      const kind = p.pinTargetKind === 'stable' ? 'beta → stable' : 'beta → beta';
+      betaLines.push(`  • ${p.pkg} ${p.current} → ${p.pinTarget} (${kind}, ${p.eligibilityLabel ?? '?'})`);
     }
   }
   if (betaLines.length > 0) {
@@ -1219,7 +1229,10 @@ export function telegramBody(
   const pinsFixed = report.repos.filter((r) => r.pinsPr?.status === 'created');
   if (pinsFixed.length > 0) {
     for (const r of pinsFixed) {
-      lines.push(`📌 Pins-PR (floating deps): *${r.name}* → ${r.pinsPr!.prUrl}`);
+      const hasBeta = (r.pins ?? []).some((p) => p.betaPin && p.pinTarget);
+      lines.push(
+        `📌 Pins-PR (${hasBeta ? 'floating deps + beta' : 'floating deps'}): *${r.name}* → ${r.pinsPr!.prUrl}`
+      );
     }
   }
   return lines.join('\n\n');

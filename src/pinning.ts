@@ -21,6 +21,16 @@
 // - Lockfile-Regen + Manifest-Schreibvorgang sind ALLES-ODER-NICHTS und laufen
 //   VOR dem PUT (vorher: Manifest-PUT zuerst, Regen-Fehler danach → Manifest
 //   ohne Lockfile im PR, PR-Body behauptete trotzdem "regenerated").
+//
+// v1.8.0 (Beta-Kanal-PRs): Pakete, die BEREITS auf einem Pre-Release stehen
+// (`payload 4.0.0-beta.7`), bekommen ein echtes Update-Ziel und damit einen
+// Pins-PR:
+// - beta → beta: neuestes Beta/RC im SELBEN Kanal (`beta.7 → beta.9`).
+// - beta → stable: das stabile Release ist da (`4.0.0-beta.7 → 4.0.0`).
+// - NIE stable → beta: stabile Pins laufen nicht in diesen Zweig (kein
+//   Beta-Hinweis, kein PR) — Owner-Regel, verhindert Dauerrauschen.
+// - Weiterhin Info-only: Exoten (nightly/canary/insiders), optional/peer-Deps
+//   und Kandidaten ohne Soaking-Reife.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -31,7 +41,7 @@ import { OWNER, log } from './config.js';
 import { b64, decodeB64, ghFetch, ghJson, ghJsonOrNull } from './github.js';
 import type { RepoInfo } from './inventory.js';
 import { regenerateLockfile, type FixResult } from './fix-pr.js';
-import { channelCompatible, classifyPrerelease, showExoticPrereleases } from './prerelease.js';
+import { channelCompatible, classifyPrerelease } from './prerelease.js';
 import { npmVersionPublishedAt } from './publish-dates.js';
 import type { RenovateCandidate } from './renovate.js';
 import { collectRenovateCandidates, renovateEnabled } from './renovate.js';
@@ -63,7 +73,7 @@ export interface PinFinding {
   releaseAgeDays?: number | null;
   /** v1.7.0: Major-/Breaking-Update → nur Report, nie PR. */
   majorOrBreaking?: boolean;
-  /** v1.6.0: Paket steht bereits auf einem Pre-Release-Kanal (Info-only). */
+  /** v1.6.0: Paket steht bereits auf einem Pre-Release-Kanal (beta/rc/alpha). */
   betaPin?: boolean;
   /** v1.6.0: Publish-Datum der Ziel-Version (Soaking). */
   latestPublishedAt?: string | null;
@@ -71,7 +81,10 @@ export interface PinFinding {
   eligibility?: Eligibility;
   eligibilityLabel?: string;
   ageDays?: number | null;
-  /** v1.6.0: neuerer Beta/RC-Kandidat (Kanal-kompatibel) — NUR Info, nie PR. */
+  /**
+   * v1.6.0/v1.8.0: neuerer Beta/RC-Kandidat im selben Kanal. Seit v1.8.0 ein
+   * echtes PR-Ziel (beta → beta), nicht mehr nur Info.
+   */
   prereleaseHint?: string | null;
   /** v1.6.0: Publish-Datum des Beta-Kandidaten. */
   prereleasePublishedAt?: string | null;
@@ -80,13 +93,21 @@ export interface PinFinding {
   prereleaseLabel?: string;
   /** v1.7.2: Peer-Konflikt — der Kandidat wurde bewusst NICHT auf `latest` gepinnt. */
   peerConflict?: PeerConflict;
-  /** v1.7.2: tatsächliches Pin-Ziel (Abweichung von `latest` nur bei Peer-Ausweichen). */
+  /**
+   * v1.7.2: tatsächliches Pin-Ziel. Abweichung von `latest` bei Peer-Ausweichen
+   * (v1.7.2) und bei Beta-Kanal-Updates (v1.8.0: beta → beta oder beta → stable).
+   */
   pinTarget?: string;
+  /** v1.8.0: Art des Beta-Ziels — `beta` = Kanal-Update, `stable` = Kanal-Abschluss. */
+  pinTargetKind?: 'beta' | 'stable';
 }
 
 export interface PinScanResult {
   findings: PinFinding[];
-  /** PR-Kandidaten: deps/devDeps, latest vorhanden, kein Protocol/Path-Spec, kein Downgrade. */
+  /**
+   * PR-Kandidaten: deps/devDeps, Ziel vorhanden (floating → `latest`, Beta →
+   * `pinTarget`), kein Protocol/Path-Spec, kein Downgrade, Soaking reif.
+   */
   fixable: PinFinding[];
 }
 
@@ -132,6 +153,8 @@ export interface PinDeps {
   peerDepsOf: (pkg: string, version: string) => Promise<Record<string, string> | null>;
   /** Versionsliste eines Pakets (für Range-Ausweichkandidaten); null = unbekannt. */
   versionsOf: (pkg: string) => Promise<string[] | null>;
+  /** Publish-Datum einer Version (Soaking) — injizierbar für Offline-Tests. */
+  publishedAt: (pkg: string, version: string) => Promise<{ publishedAt: string | null }>;
   /** Repo-relativer Pfad unter `ref` → Datei oder null (404). */
   contentsGet: (repo: string, filePath: string, ref: string) => Promise<GhFile | null>;
   /** Datei schreiben (sha = Blob-SHA). message ohne `[skip ci]`. */
@@ -164,6 +187,10 @@ export function pinDeps(): PinDeps {
     packument: (pkg) => npmPackument(pkg),
     peerDepsOf: (pkg, version) => npmPeerDependencies(pkg, version),
     versionsOf: (pkg) => npmVersions(pkg),
+    publishedAt: async (pkg, version) => {
+      const r = await npmVersionPublishedAt(pkg, version);
+      return { publishedAt: r.publishedAt };
+    },
     contentsGet: (repo, filePath, ref) =>
       ghJsonOrNull<GhFile>(`/repos/${OWNER}/${repo}/contents/${filePath}?ref=${encodeURIComponent(ref)}`),
     contentsPut: async (repo, filePath, branch, blobSha, content, message) => {
@@ -218,6 +245,20 @@ export function isPinnedPrereleaseSpec(spec: unknown): spec is string {
   const v = semver.valid(s);
   if (!v) return false;
   return semver.prerelease(v) !== null;
+}
+
+/**
+ * Untergrenze einer Floating-Range, sofern diese ein Pre-Release ist (v1.8.0):
+ * `^4.0.0-beta.7` → `4.0.0-beta.7`. Stabile Ranges/`*` → null. Damit werden
+ * auch Ranges als Beta-Kanal erkannt (nie aber `stable → beta`, weil eine
+ * stabile Untergrenze null ergibt).
+ */
+export function prereleaseFloor(spec: unknown): string | null {
+  const s = typeof spec === 'string' ? spec.trim() : '';
+  if (!s) return null;
+  const min = semver.minVersion(s);
+  if (!min || semver.prerelease(min.version) === null) return null;
+  return min.version;
 }
 
 /** Sammle package.json-Dateien (repoDir-Checkout nach Tarball-Entpacken). */
@@ -312,34 +353,47 @@ async function npmPeerDependencies(pkg: string, version: string): Promise<Record
 }
 
 /**
- * Neuester Kanal-kompatibler Pre-Release-Kandidat (v1.6.0, N2): höchste Version
- * aus den dist-tags mit `-beta`/`-rc`/`-alpha`, die NEUER als `current` ist und
- * im selben Kanal liegt. Exoten (`next`, `dev`, `insiders`) werden nur bei
- * SHOW_EXOTIC_PRERELEASES berücksichtigt. NIE Bump-Ziel — nur Info.
+ * Upgrade-Ziel für ein Paket, das BEREITS auf einem Pre-Release-Kanal liegt
+ * (v1.8.0). Höchste neuere Version aus den dist-tags, die entweder
+ *
+ * - denselben Kanal hat (`beta → beta`, `rc → rc`, `alpha → alpha`), oder
+ * - ein STABILES Release ist (`beta → stable` = Kanal abgeschlossen).
+ *
+ * Bewusst NICHT möglich: `stable → beta` (Aufrufer prüft `current`), Kanal-
+ * Wechsel (`rc → beta`) und Exoten (`nightly`/`canary`/`insiders` — die werden
+ * nie automatisch gebumpt, unabhängig von `SHOW_EXOTIC_PRERELEASES`).
+ *
+ * `kind` steuert Report/PR-Body: `beta` = Kanal-Update, `stable` = Abschluss.
  */
-function betaCandidate(
+export function prereleaseUpgradeTarget(
   current: string,
   distTags: Record<string, string> | undefined
-): string | null {
+): { target: string; kind: 'beta' | 'stable' } | null {
   if (!distTags) return null;
   // WICHTIG: die VOLLE Version vergleichen, nicht coerce() — coerce() strippt
   // den Prerelease-Teil ("4.0.0-beta.7" → "4.0.0"), wodurch 4.0.0-beta.8 nie
   // größer wäre (Bug v1.6.0, im Prod-Report aufgefallen).
   const cur = semver.valid(current) ?? semver.coerce(current)?.version ?? null;
-  const candidates: string[] = [];
-  for (const [tag, version] of Object.entries(distTags)) {
+  // Nur Pakete, die SCHON im Pre-Release-Kanal sind → nie stable → beta.
+  if (!cur || semver.prerelease(cur) === null) return null;
+  const candidates: Array<{ target: string; kind: 'beta' | 'stable' }> = [];
+  for (const version of Object.values(distTags)) {
     if (!semver.valid(version)) continue;
-    if (semver.prerelease(version) === null) continue;
+    if (!semver.gt(version, cur)) continue;
+    if (semver.prerelease(version) === null) {
+      candidates.push({ target: version, kind: 'stable' });
+      continue;
+    }
     const cls = classifyPrerelease(version);
-    if (cls.cls === 'exotic' && !showExoticPrereleases()) continue;
-    if (!channelCompatible(current, version)) continue;
-    if (cur && !semver.gt(version, cur)) continue;
-    // `next`/`dev`-dist-tags sind oft Build-Snapshots; nur bei explizitem Opt-in
-    if (cls.cls === 'exotic' && !/^(next|dev|insiders|canary|nightly)$/i.test(tag)) continue;
-    candidates.push(version);
+    if (cls.cls === 'exotic') continue; // nightly/canary/insiders: nie automatisch
+    if (!channelCompatible(current, version)) continue; // rc ≠ beta
+    candidates.push({ target: version, kind: 'beta' });
   }
   if (candidates.length === 0) return null;
-  return candidates.sort((a, b) => semver.rcompare(a, b))[0] ?? null;
+  // Höchste Version gewinnt: liegt das stabile Release über dem neuesten Beta,
+  // ist das der Abschluss (beta.9 < 4.0.0 → stable).
+  candidates.sort((a, b) => semver.rcompare(a.target, b.target));
+  return candidates[0] ?? null;
 }
 
 /**
@@ -574,24 +628,31 @@ export async function collectPinning(
       const sectionDeps = json[section];
       if (!sectionDeps || typeof sectionDeps !== 'object') continue;
       for (const [pkg, spec] of Object.entries(sectionDeps as Record<string, unknown>)) {
+        const specStr = typeof spec === 'string' ? spec.trim() : String(spec);
         const floating = isFloatingSpec(spec);
         const betaPinned = !floating && isPinnedPrereleaseSpec(spec);
         if (!floating && !betaPinned) continue;
         const packument = await deps.packument(pkg);
         const latest = packument?.['dist-tags']?.latest ?? null;
+        // v1.8.0: Basis des Beta-Kanals. Exakter Pre-Release-Pin → die Version
+        // selbst; floating Pre-Release-Range (`^4.0.0-beta.7`) → ihre
+        // Untergrenze. Stabile Specs liefern null (nie stable → beta).
+        const betaBase = betaPinned ? specStr : floating ? prereleaseFloor(specStr) : null;
         const finding: PinFinding = {
           pkg,
-          current: typeof spec === 'string' ? spec.trim() : String(spec),
+          current: specStr,
           latest,
           section,
           manifestPath: rel,
           severity: section === 'dependencies' ? 'warn' : 'info',
-          betaPin: betaPinned,
+          betaPin: betaBase !== null,
         };
         // Soaking (v1.6.0): Alter des Ziel-Kandidaten bestimmen. latest ist kein
         // CVE-Fix (kein Advisory-Bezug im Pinning-Pfad) → nur die 3-Tage-Regen.
-        if (floating && latest) {
-          const pub = await npmVersionPublishedAt(pkg, latest);
+        // Beta-Pakete bekommen ihr Ziel weiter unten (latest ist dort oft die
+        // stabile 3.x-Linie und damit kein sinnvolles Pin-Ziel).
+        if (floating && latest && betaBase === null) {
+          const pub = await deps.publishedAt(pkg, latest);
           const el = updateEligibility({
             variantChange: false,
             publishedAt: pub.publishedAt,
@@ -602,27 +663,44 @@ export async function collectPinning(
           finding.eligibilityLabel = el.label;
           finding.ageDays = el.ageDays;
         }
-        // Beta-Hinweis (v1.6.0, N2): NUR für Pakete, die schon auf einem
-        // Beta/RC-Kanal liegen — und nur Bericht, nie Bump-Ziel.
-        if (betaPinned) {
-          const beta = betaCandidate(finding.current, packument?.['dist-tags']);
-          if (beta) {
-            finding.prereleaseHint = beta;
-            const pub = await npmVersionPublishedAt(pkg, beta);
+        // Beta-Kanal (v1.8.0): Pakete, die BEREITS auf einem Pre-Release
+        // stehen, bekommen ein echtes Update-Ziel — beta → beta (neueres Beta
+        // im selben Kanal) oder beta → stable (Kanal abgeschlossen). NIE
+        // stable → beta: stabile Pins laufen gar nicht erst in diesen Zweig.
+        if (betaBase !== null) {
+          const up = prereleaseUpgradeTarget(betaBase, packument?.['dist-tags']);
+          if (up) {
+            const pub = await deps.publishedAt(pkg, up.target);
             const el = updateEligibility({
               variantChange: false,
               publishedAt: pub.publishedAt,
               cveFix: false,
             });
-            finding.prereleasePublishedAt = pub.publishedAt;
-            finding.prereleaseEligibility = el.eligibility;
-            finding.prereleaseLabel = el.label;
+            finding.pinTarget = up.target;
+            finding.pinTargetKind = up.kind;
+            finding.latestPublishedAt = pub.publishedAt;
+            finding.eligibility = el.eligibility;
+            finding.eligibilityLabel = el.label;
+            finding.ageDays = el.ageDays;
+            if (up.kind === 'beta') {
+              // Report-Spalte "Beta/RC" zeigt den Kanal-Kandidaten (Kompat.).
+              finding.prereleaseHint = up.target;
+              finding.prereleasePublishedAt = pub.publishedAt;
+              finding.prereleaseEligibility = el.eligibility;
+              finding.prereleaseLabel = el.label;
+            }
+          } else if (floating) {
+            // Kein neueres Ziel: floating Pre-Release trotzdem auf die
+            // Kanal-Untergrenze pinnen (Pinning-Policy: keine Ranges).
+            finding.pinTarget = betaBase;
+            finding.pinTargetKind = 'beta';
+            finding.eligibilityLabel = 'Pin auf Kanal-Untergrenze';
           }
         }
         // Peer-Gate (v1.7.2): nur PR-Sektionen, nur mit echtem Pin-Ziel. Die
         // Range-/Versions-Lookups laufen über dieselben injizierten Deps wie
         // der Packument-Fetch (Tests: offline).
-        if (PR_SECTIONS.includes(section) && latest && !betaPinned) {
+        if (PR_SECTIONS.includes(section) && latest && !finding.betaPin) {
           const others: Record<string, string> = {};
           for (const s of DIRECT_SECTIONS) {
             const sect = json[s];
@@ -642,7 +720,7 @@ export async function collectPinning(
               // Peer-Vertrag zu brechen. `latest` bleibt informativ erhalten.
               finding.pinTarget = conflict.fallback;
               if (conflict.fallback !== finding.current) {
-                const pub = await npmVersionPublishedAt(pkg, conflict.fallback);
+                const pub = await deps.publishedAt(pkg, conflict.fallback);
                 const el = updateEligibility({
                   variantChange: false,
                   publishedAt: pub.publishedAt,
@@ -682,13 +760,20 @@ export async function collectPinning(
   const fixable: PinFinding[] = [];
   for (const f of findings) {
     if (!PR_SECTIONS.includes(f.section)) continue; // optional/peer = report-only
+    // Beta-Kanal (v1.8.0): ein echtes Ziel gibt es nur bei beta → beta oder
+    // beta → stable. Ohne Ziel (kein neueres Beta, kein stabiles Release)
+    // bleibt das Finding reine Report-Info. Soaking gilt auch hier.
+    if (f.betaPin) {
+      if (!f.pinTarget) continue;
+      if (f.eligibility === 'too-young') continue;
+      fixable.push(f);
+      continue;
+    }
     if (!f.latest) continue;
     // Peer-Konflikt ohne Ausweichversion → fail-closed, kein Pin (v1.7.2).
     if (f.peerConflict && !f.pinTarget) continue;
     // Renovate-Major-/Breaking-Updates: nur Report, nie PR (Owner-Regel).
     if (f.majorOrBreaking) continue;
-    // Beta-Pins sind Info-only: das Paket soll bewusst im Beta-Kanal bleiben.
-    if (f.betaPin) continue;
     // Soaking (v1.6.0): nur reife Ziel-Versionen werden gepinnt. Zu junge
     // Kandidaten bleiben im Report ("zu jung (2d)") und warten auf den nächsten Lauf.
     if (f.eligibility === 'too-young') continue;
@@ -801,6 +886,7 @@ export async function createPinsPr(
   if (repo.archived) return { status: 'skipped', note: 'Repo archived — kein Pins-PR (hard guard)' };
 
   const branch = pinsBranchName();
+  const hasBeta = findings.some((f) => f.betaPin);
   const byManifest = new Map<string, PinFinding[]>();
   for (const f of findings) {
     const cur = byManifest.get(f.manifestPath);
@@ -856,12 +942,19 @@ export async function createPinsPr(
         const peerSuffix = f.peerConflict
           ? `, Peer-Ausweichen: ${f.peerConflict.dep}@${f.peerConflict.depVersion} requires ${f.peerConflict.range} (latest wäre ${f.latest})`
           : '';
+        const betaSuffix = f.betaPin
+          ? f.pinTargetKind === 'stable'
+            ? ', Beta-Kanal abgeschlossen (beta → stable)'
+            : f.pinTarget !== (prereleaseFloor(f.current) ?? f.current)
+              ? ', Beta-Kanal (beta → beta)'
+              : ', Beta-Kanal (Range → exakt)'
+          : '';
         fileBumped.push(
           `${f.pkg}: ${f.current} → ${target} (${f.section}${
             semver.major(semver.coerce(target) ?? '0.0.0') !== semver.major(semver.coerce(f.current) ?? '0.0.0')
               ? ', ⚠️ major jump'
               : ''
-          }${peerSuffix})`
+          }${peerSuffix}${betaSuffix})`
         );
       }
       if (fileBumped.length === 0) continue;
@@ -914,7 +1007,7 @@ export async function createPinsPr(
         branch,
         pkgFile.sha,
         updatedPkg,
-        `chore(cve-audit): pin floating dependencies in ${manifestPath} to exact versions`
+        `chore(cve-audit): pin dependencies in ${manifestPath} to exact versions`
       );
       changed = true;
       bumped.push(...fileBumped);
@@ -930,7 +1023,9 @@ export async function createPinsPr(
     }
 
     const pr = await deps.createPr(repo.name, {
-      title: 'chore(cve-audit): pin floating dependencies to exact versions',
+      title: hasBeta
+        ? 'chore(cve-audit): pin dependencies to exact versions (incl. beta channel updates)'
+        : 'chore(cve-audit): pin floating dependencies to exact versions',
       head: branch,
       base: repo.defaultBranch,
       body: pinsPrBody(repo.name, findings, bumped, notes, lockfiles, skipped),
@@ -993,6 +1088,11 @@ function pinsPrBody(
     'ranges/`*`. This PR pins every floating dependency to the latest exact',
     'version published at the time of the scan.',
     '',
+    'Packages that are **already on a pre-release channel** are updated inside',
+    'that channel (`beta → beta`) or to the stable release that closes it',
+    '(`beta → stable`). A package on stable is **never** moved into a pre-release',
+    'channel.',
+    '',
     'Peer contracts are respected: if another direct dependency declares a',
     '`peerDependencies` range for a package, the pin is the highest version',
     'inside that range (never a version that would break `npm ci` with ERESOLVE).',
@@ -1000,6 +1100,25 @@ function pinsPrBody(
     '### Pinned to exact versions',
   ];
   for (const b of bumped) lines.push(`- ${b}`);
+  const betaBumps = findings.filter(
+    (f) =>
+      f.betaPin &&
+      f.pinTarget &&
+      // Nur echte Updates listen — ein reiner Range→exakt-Pin (Untergrenze)
+      // steht schon in der Liste oben.
+      f.pinTarget !== (prereleaseFloor(f.current) ?? f.current)
+  );
+  if (betaBumps.length > 0) {
+    lines.push(
+      '',
+      '### Beta/RC channel updates',
+      'Only packages already on a pre-release channel (no `stable → beta`):'
+    );
+    for (const f of betaBumps) {
+      const kind = f.pinTargetKind === 'stable' ? 'beta → stable' : 'beta → beta';
+      lines.push(`- \`${f.pkg}\`: ${f.current} → ${f.pinTarget} (${kind}, ${f.eligibilityLabel ?? '?'})`);
+    }
+  }
   const peerSkipped = findings.filter(
     (f) => f.peerConflict && !f.pinTarget && !f.betaPin && (f.section === 'dependencies' || f.section === 'devDependencies')
   );

@@ -1,5 +1,6 @@
-// Pre-Release-/Beta-Klassifikation (v1.6.0, N2): Betas werden ERKANNT und als
-// Info gemeldet — aber NIE automatisch gebumpt (kein Pin-PR, kein Image-Bump).
+// Pre-Release-/Beta-Klassifikation (v1.6.0, N2; erweitert v1.8.0): Betas werden
+// ERKANNT und — nur wenn das Paket schon im Kanal liegt — im selben Kanal bzw.
+// auf das stabile Release gebumpt (beta → beta, beta → stable). Nie stable → beta.
 //
 // Drei Klassen (Review §5.1):
 // - `channel`   — Beta/RC/Alpha (`-beta`, `-rc.1`, `-alpha`): sichtbar, prüfbar.
@@ -51,13 +52,9 @@ export function showExoticPrereleases(): boolean {
 }
 
 /**
- * Beta-Hinweis (v1.6.0): NUR wenn das Paket sich BEREITS auf einem Pre-Release-
- * Kanal befindet (Owner-Entscheidung: keine „es gibt eine Beta"-Werbung für
- * stabile Pakete — das erzeugt Dauerrauschen bei payload/next/tailwind).
- *
- * Vorgeschlagen wird ausschließlich der neueste Pre-Release im SELBEN Kanal
- * (rc → rc, beta → beta), der neuer als der current-Stand ist. Channel-Wechsel
- * (rc → beta) und stable → beta sind ausdrücklich NICHT vorgesehen.
+ * Kanal-Kompatibilität (v1.6.0/v1.8.0): nur derselbe Pre-Release-Kanal ist ein
+ * zulässiges Beta-Ziel (rc → rc, beta → beta). Kanal-Wechsel und
+ * stable → beta sind ausdrücklich NICHT vorgesehen.
  */
 export function channelCompatible(current: string, candidate: string): boolean {
   const c = classifyPrerelease(current);

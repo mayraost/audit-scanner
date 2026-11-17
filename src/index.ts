@@ -584,8 +584,8 @@ function fakeRepo(name: string, images: ImageFinding[]): RepoResult {
 /**
  * Purer Selbsttest Soaking + Pre-Release (v1.6.0): fixe Fake-Uhr, kein Netzwerk.
  * Kernregeln des Owners: Updates erst nach UPDATE_MIN_AGE_DAYS (=3) Tagen,
- * Ausnahme NUR bei belegtem H/C-CVE-Fix; Beta-Hinweis NUR für Pakete, die
- * schon im Beta-Kanal liegen.
+ * Ausnahme NUR bei belegtem H/C-CVE-Fix; Beta-Ziele NUR für Pakete, die
+ * schon im Beta-Kanal liegen (beta → beta oder beta → stable, nie stable → beta).
  */
 /**
  * Selbsttest Renovate (v1.7.0): Parser + Einordnung in PinFinding.

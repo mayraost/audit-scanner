@@ -56,7 +56,7 @@ Reminder-Verhalten (CVE/Pins werden täglich erinnert, Images bewusst nicht).
 | --- | --- | --- | --- |
 | `cve` | `cve-audit/fixes-<YYYY-MM-DD>` | fixbares trivy/GHSA-Finding (npm/pip, first_patched vorhanden) | tägliche Telegram-Erinnerung (Tag-Counter), State-Dedupe |
 | `image` | `cve-audit/images-<YYYY-MM-DD>` | exakt gepinnter Tag mit neuerer Version im selben Major **oder** floating Major-Tag (Pinning-PR) | kein CVE-Reminder — Image-PRs gelten als kurzlebig, State-Eintrag hat `kind: "image"`, taucht nie in der Reminder-Sektion auf |
-| `pins` | `cve-audit/pins-<YYYY-MM-DD>` | floating npm-Specifier in `dependencies`/`devDependencies` (EIN PR je Repo mit allen Manifests) | tägliche Telegram-Erinnerung, State-Eintrag `kind: "pins"` |
+| `pins` | `cve-audit/pins-<YYYY-MM-DD>` | floating npm-Specifier in `dependencies`/`devDependencies` **oder** Beta-Kanal-Update (`beta → beta`, `beta → stable`) — EIN PR je Repo mit allen Manifests | tägliche Telegram-Erinnerung, State-Eintrag `kind: "pins"` |
 
 ## Wie es funktioniert
 
@@ -270,7 +270,10 @@ gescanntem Repo:
 4. **Pins-PR** (deterministisch, kein LLM): ALLE floating deps eines Repos in
    **einem PR** (`cve-audit/pins-<date>`), alle package.json-Manifests des
    Repos in derselben Branch. Bump auf exakte latest-Version, Downgrade-Guard
-   analog CVE-Fix. Major-Sprünge werden im PR-Body mit `⚠️ major jump`
+   analog CVE-Fix. **Beta-Kanal (seit v1.8.0):** Pakete, die bereits auf
+   `-beta`/`-rc` stehen, werden im selben Kanal gebumpt (`beta → beta`) oder
+   auf das stabile Release (`beta → stable`); `stable → beta` bleibt verboten.
+   Major-Sprünge werden im PR-Body mit `⚠️ major jump`
    markiert und sind bewusst vom Menschen zu akzeptieren.
    **Peer-aware (seit v1.7.2):** deklariert eine andere direkte dep des
    Manifests eine `peerDependencies`-Range für das Paket (Payload verlangt
@@ -286,10 +289,13 @@ gescanntem Repo:
    „Lockfiles regenerated" nur noch, wenn es stimmt. Lockfile-Regen im
    Manifestverzeichnis (`npm install --package-lock-only`-Style, pnpm analog
    via corepack `--lockfile-only`); ohne abdeckendes Lockfile → fail-closed.
-   **Commit-Messages ohne `[skip ci]`** (siehe Docker-Abschnitt).
+   **Commit-Messages ohne `[skip ci]`** (siehe Docker-Abschnitt). Achtung:
+   Coolify prüft die **gesamte** Commit-Message (auch den Body) auf den Marker —
+   ein Satz wie „kein `[skip ci]`-Marker" im Body überspringt den Deploy
+   genauso wie der Marker im Betreff.
 5. **Report/Telegram**: Report-Sektion `📌 Unpinned deps (package.json)` je
    Repo (`pkg | current ^1.2.3 | latest exact X.Y.Z | scope | sev | soaking |
-   beta`), Summary `unpinned deps: N` + `pinsPrs`-Zähler, Telegram `📌 Unpinned
+   beta-ziel`), Summary `unpinned deps: N` + `pinsPrs`-Zähler, Telegram `📌 Unpinned
    deps`-Block + `Pins-PRs diesmal: …`. State-Eintrag `kind: "pins"` (mit Reminder).
 
 ## ⏳ Soaking & Beta-Erkennung (seit v1.6.0)
@@ -327,17 +333,27 @@ umgeht die Wartezeit — Status `cve-exempt`. Bewusst **streng**:
 Status im Report: `✓ reif (5d)` · `⏳ zu jung (2d)` · `🔴 CVE-Fix, sofort` ·
 `⛔ Variant-Wechsel — kein Update`.
 
-**Regel 3 — Beta-Hinweis nur für Beta-Pakete.** Ein Pre-Release-Kandidat
-(`-beta`, `-rc`, `-alpha`) wird **ausschließlich dann** gemeldet, wenn das Paket
-**bereits** auf einem Beta/RC-Kanal liegt — und dann nur im **selben Kanal**
-(`rc → rc`, nicht `rc → beta`, nie `stable → beta`). Beta-Updates sind immer
-**info-only**: nie Bump-Ziel, nie Pins-PR, nie Image-Bump. Nightly/Canary/
-Dev/Insiders (`prerelease-exotic`) sind standardmäßig stumm
-(`SHOW_EXOTIC_PRERELEASES=1` zum Zeigen).
+**Regel 3 — Beta-Kanal nur für Beta-Pakete (seit v1.8.0 mit PR).** Ein
+Pre-Release-Kandidat (`-beta`, `-rc`, `-alpha`) wird **ausschließlich dann**
+angeboten, wenn das Paket **bereits** auf einem Beta/RC-Kanal liegt. Erlaubt
+sind nur zwei Richtungen:
+
+- **beta → beta** — neuestes Beta/RC im **selben** Kanal (`4.0.0-beta.7 →
+  4.0.0-beta.9`, `rc → rc`; nie `rc → beta`).
+- **beta → stable** — das stabile Release schließt den Kanal ab (`4.0.0-beta.7
+  → 4.0.0`). Liegt es über dem neuesten Beta, gewinnt es.
+
+**Nie `stable → beta`:** ein stabil gepinntes Paket (z. B. `payload 3.x`)
+bekommt weder Beta-Hinweis noch PR — das wäre Dauerrauschen. Exoten
+(Nightly/Canary/Dev/Insiders) sind grundsätzlich kein Auto-Ziel
+(`SHOW_EXOTIC_PRERELEASES=1` zeigt sie nur im Report). Beta-Ziele laufen durch
+dieselbe 3-Tage-Reife wie alle anderen Updates und landen im normalen
+Pins-PR (Commit-Titel/Body kennzeichnen `beta → beta` bzw. `beta → stable`).
 
 Telegram: `ℹ️ Beta/RC-Updates (Paket bereits im Beta-Kanal)` — nur für Kandidaten
-mit Soaking-Reife. Zu junge Updates erscheinen im Alert als
-`⏳ zu jung (2d) (Report)`, also ohne Handlungsaufforderung.
+mit Soaking-Reife, jeweils mit Ziel und Richtung (`beta → beta` /
+`beta → stable`). Das Ziel landet im Pins-PR; zu junge Updates erscheinen im
+Alert als `⏳ zu jung (2d) (Report)`, also ohne Handlungsaufforderung.
 
 ## 🤖 Renovate als Analyse-Quelle (seit v1.7.0)
 
@@ -615,6 +631,7 @@ Kompakte Release-Historie (git history; Version in package.json):
 | v1.7.5 | `trap`-Absicherung: auch stummer Abbruch (Signal/OOM/Timeout) meldet |
 | v1.7.6 | Telegram-Retry (3×, 1 s/3 s/7 s) + Alarm-Merker erst nach Erfolg; HEALTHCHECK 26 h statt 48 h |
 | v1.7.7 | Crash-Diagnose: `NODE_OPTIONS=--report-on-signal --report-signal=SIGSEGV` → Diagnose-Report in `/app/logs` |
+| v1.8.0 | Beta-Kanal-PRs: Pakete bereits im Beta/RC-Kanal werden im Pins-PR gebumpt (`beta → beta` / `beta → stable`), nie `stable → beta`; Soaking gilt auch für Beta-Ziele |
 
 ## Tests & Sicherheit
 
@@ -628,12 +645,13 @@ Kompakte Release-Historie (git history; Version in package.json):
   `digests.json` → leerer Start, erster Lauf setzt `firstSeen`, gleicher Digest
   → stabil, geänderter Digest → `digestChanged` + `previousDigest`,
   90-Tage-Prune, Empfehlungstexte + Telegram-Zeilenlänge.
-- `pinning-test` (v1.7.2) — Pins-PR-Qualität **offline** (Fake-Registry,
+- `pinning-test` (v1.7.2/v1.8.0) — Pins-PR-Qualität **offline** (Fake-Registry,
   Fake-GitHub-contents, Fake-Lockfile-Regen): Peer-Konflikt → Ausweichversion
   bzw. fail-closed kein Pin, Regen-Fehler → **kein** Manifest-Commit im PR
   (Draft + `⚠️ NOT applied`), Lockfile-Commit vor Manifest-Commit, keine
-  `[skip ci]`-Marker, Image-Tag-Präfix-Flip für Docker Hub/MCR/Quay und
-  „kein Image" nur bei belastbarer Probe.
+  `[skip ci]`-Marker, Image-Tag-Präfix-Flip für Docker Hub/MCR/Quay,
+  „kein Image" nur bei belastbarer Probe, Beta-Kanal-Ziele
+  (`beta → beta`, `beta → stable`, kein `stable → beta`, Soaking).
 - `renovate-test` (v1.7.0) — Renovate-Analyse **offline**: eingebettetes
   JSONL-Fixture in der echten Log-Form (`msg: "packageFiles with updates"`,
   Update-Daten unter `config`) prüft Parser (nur deps mit `updates[]`, höchste

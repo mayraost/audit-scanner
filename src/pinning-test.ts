@@ -25,7 +25,15 @@ import path from 'node:path';
 import semver from 'semver';
 
 import type { PinDeps, PinFinding, GhFile } from './pinning.js';
-import { createPinsPr, effectiveVersion, peerConflictLabel, peerGate, renovateCandidatesToPinFindings } from './pinning.js';
+import {
+  collectPinning,
+  createPinsPr,
+  effectiveVersion,
+  peerConflictLabel,
+  peerGate,
+  prereleaseUpgradeTarget,
+  renovateCandidatesToPinFindings,
+} from './pinning.js';
 import { isBelievable, registryTagCandidates, type ManifestProbe } from './release-check.js';
 import { splitRef } from './image-scan.js';
 import type { RepoInfo } from './inventory.js';
@@ -34,6 +42,8 @@ import type { State } from './state.js';
 /** Registry-Fixture: pkg → { latest, versions: {ver: peerDeps} }. */
 interface FakePkg {
   latest: string;
+  /** Weitere dist-tags (z. B. `beta`, `rc`, `next`). */
+  tags?: Record<string, string>;
   versions: Record<string, Record<string, string>>;
 }
 
@@ -41,6 +51,8 @@ export interface PinTestFakes {
   registry?: Record<string, FakePkg>;
   /** repo-relativer Pfad → Datei-Inhalt (Branch-Stand). */
   files?: Record<string, string>;
+  /** `<pkg>@<version>` → Publish-Datum (Soaking); Default: alt genug. */
+  published?: Record<string, string>;
   /** Regenerat: lockPath → geänderter Inhalt ODER Fehler-Note (null = unchanged). */
   regen?: (lockContent: string, pkgJson: string) => { content: string | null; note?: string };
   /** Kandidaten, für die der Regen fehlschlagen soll (pkg-Namen). */
@@ -77,7 +89,7 @@ export function fakeDeps(
     if (!p) return Promise.resolve(null);
     const versions: Record<string, { peerDependencies?: Record<string, string> }> = {};
     for (const [v, peers] of Object.entries(p.versions)) versions[v] = { peerDependencies: peers };
-    return Promise.resolve({ 'dist-tags': { latest: p.latest }, versions });
+    return Promise.resolve({ 'dist-tags': { latest: p.latest, ...(p.tags ?? {}) }, versions });
   };
   return {
     packument,
@@ -86,6 +98,9 @@ export function fakeDeps(
       const p = await packument(pkg);
       return p?.versions ? Object.keys(p.versions) : null;
     },
+    publishedAt: async (pkg, version) => ({
+      publishedAt: f.published?.[`${pkg}@${version}`] ?? '2026-01-01T00:00:00Z',
+    }),
     contentsGet: async (_repo, filePath): Promise<GhFile | null> =>
       filePath in files ? { sha: `sha-${filePath}`, content: Buffer.from(files[filePath]!, 'utf8').toString('base64') } : null,
     contentsPut: async (_repo, filePath, _branch, _sha, content, message) => {
@@ -452,6 +467,167 @@ export async function pinningTest(): Promise<number> {
     check('D5d beide Bumps in EINEM package.json-Commit', /"lodash": "4\.18\.1"/.test(manifest) && /"semver": "7\.8\.6"/.test(manifest));
     check('D5d Lockfile im selben PR regeneriert', rec.puts.some((p) => p.path === 'package-lock.json'), rec.puts.map((p) => p.path).join(','));
     check('D5d ein PR für beide Quellen', result.status === 'created' && rec.prBodies.length === 1);
+  }
+
+  // ————————————— v1.8.0: Beta-Kanal-PRs (beta → beta / beta → stable) —————————————
+  // Regel: NUR Pakete, die schon auf einem Pre-Release stehen. Stabile Pakete
+  // (z. B. payload 3.x) bekommen weiterhin KEINEN Beta-Hinweis und keinen PR.
+  {
+    const up = prereleaseUpgradeTarget('4.0.0-beta.7', { latest: '3.62.0', beta: '4.0.0-beta.9' });
+    check('B1 beta → beta: neuestes Beta im selben Kanal', up?.target === '4.0.0-beta.9' && up.kind === 'beta', JSON.stringify(up));
+    const grad = prereleaseUpgradeTarget('4.0.0-beta.7', { latest: '4.0.0', beta: '4.0.0-beta.9' });
+    check('B2 beta → stable: stabiles Release schließt den Kanal ab', grad?.target === '4.0.0' && grad.kind === 'stable', JSON.stringify(grad));
+    check(
+      'B3 stable → beta ist verboten',
+      prereleaseUpgradeTarget('3.62.0', { latest: '3.62.0', beta: '4.0.0-beta.9' }) === null
+    );
+    check(
+      'B4 Kanal-Wechsel rc → beta ist verboten',
+      prereleaseUpgradeTarget('4.0.0-rc.1', { beta: '4.0.0-beta.9' }) === null
+    );
+    check('B5 rc → rc im selben Kanal erlaubt', prereleaseUpgradeTarget('4.0.0-rc.1', { rc: '4.0.0-rc.2' })?.target === '4.0.0-rc.2');
+    check('B6 kein neueres Beta → null (kein PR)', prereleaseUpgradeTarget('4.0.0-beta.9', { beta: '4.0.0-beta.9' }) === null);
+    check(
+      'B7 Exoten (nightly/next) sind kein Auto-Ziel',
+      prereleaseUpgradeTarget('4.0.0-beta.7', { next: '4.0.0-nightly.20261117' }) === null
+    );
+  }
+
+  // End-to-End: collectPinning (Fake-Registry) → findings/fixable → PR.
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pinning-beta-'));
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'package.json'),
+        `${JSON.stringify(
+          {
+            name: 'beta-demo',
+            dependencies: {
+              '@payloadcms/db-postgres': '4.0.0-beta.7',
+              '@payloadcms/ui': '^4.0.0-beta.7',
+              '@payloadcms/live-preview-react': '^4.0.0-beta.7',
+              '@payloadcms/richtext-lexical': '^3.93.0',
+              payload: '4.0.0-beta.7',
+              next: '16.0.0',
+              lodash: '^4.17.0',
+            },
+          },
+          null,
+          2
+        )}\n`
+      );
+      const registry: Record<string, FakePkg> = {
+        '@payloadcms/db-postgres': {
+          latest: '3.62.0',
+          tags: { beta: '4.0.0-beta.9' },
+          versions: { '4.0.0-beta.9': {} },
+        },
+        payload: { latest: '4.0.0', tags: { beta: '4.0.0-beta.9' }, versions: { '4.0.0': {} } },
+        '@payloadcms/ui': {
+          latest: '3.62.0',
+          tags: { beta: '4.0.0-beta.9' },
+          versions: { '4.0.0-beta.9': {} },
+        },
+        '@payloadcms/live-preview-react': {
+          latest: '3.62.0',
+          tags: { beta: '4.0.0-beta.7' },
+          versions: { '4.0.0-beta.7': {} },
+        },
+        '@payloadcms/richtext-lexical': {
+          latest: '3.93.0',
+          tags: { beta: '4.0.0-beta.9' },
+          versions: { '3.93.0': {} },
+        },
+        lodash: { latest: '4.18.1', versions: { '4.18.1': {} } },
+      };
+      const rec: PinTestRecorder = { puts: [], prBodies: [], prDrafts: [] };
+      const pin = await collectPinning(REPO, dir, fakeDeps({ registry }, rec));
+      const db = pin.findings.find((f) => f.pkg === '@payloadcms/db-postgres');
+      check(
+        'B8 beta.7 → beta.9 als PR-Ziel erkannt',
+        db?.pinTarget === '4.0.0-beta.9' && db.pinTargetKind === 'beta',
+        JSON.stringify(db && { target: db.pinTarget, kind: db.pinTargetKind })
+      );
+      check('B8 Beta-Ziel ist soaking-reif', db?.eligibility === 'eligible', String(db?.eligibility));
+      const payload = pin.findings.find((f) => f.pkg === 'payload');
+      check(
+        'B9 beta → stable: payload 4.0.0 als Ziel',
+        payload?.pinTarget === '4.0.0' && payload.pinTargetKind === 'stable',
+        JSON.stringify(payload && { target: payload.pinTarget, kind: payload.pinTargetKind })
+      );
+      check('B10 stabile exakte Pin (next 16.0.0) erzeugt KEIN Finding/Beta-Hinweis', !pin.findings.some((f) => f.pkg === 'next'));
+      check(
+        'B11 Beta-Ziele sind fixable (PR), floating lodash auch',
+        pin.fixable.some((f) => f.pkg === '@payloadcms/db-postgres') &&
+          pin.fixable.some((f) => f.pkg === 'payload') &&
+          pin.fixable.some((f) => f.pkg === 'lodash'),
+        pin.fixable.map((f) => `${f.pkg}@${f.pinTarget ?? f.latest}`).join(', ')
+      );
+      const ui = pin.findings.find((f) => f.pkg === '@payloadcms/ui');
+      check(
+        'B16 floating Beta-Range (^4.0.0-beta.7) → beta.9 erkannt',
+        ui?.pinTarget === '4.0.0-beta.9' && ui?.pinTargetKind === 'beta' && ui?.betaPin === true,
+        JSON.stringify(ui && { target: ui.pinTarget, kind: ui.pinTargetKind })
+      );
+      const lpr = pin.findings.find((f) => f.pkg === '@payloadcms/live-preview-react');
+      check(
+        'B17 floating Beta-Range ohne neueres Ziel → Pin auf Kanal-Untergrenze',
+        lpr?.pinTarget === '4.0.0-beta.7' &&
+          lpr?.betaPin === true &&
+          pin.fixable.some((f) => f.pkg === '@payloadcms/live-preview-react'),
+        JSON.stringify(lpr && { target: lpr.pinTarget, kind: lpr.pinTargetKind })
+      );
+      const stablePin = pin.findings.find((f) => f.pkg === '@payloadcms/richtext-lexical');
+      check(
+        'B18 stabiles Paket (payload 3.x) bekommt KEINEN Beta-Hinweis',
+        stablePin !== undefined &&
+          stablePin.betaPin === false &&
+          stablePin.prereleaseHint === undefined &&
+          stablePin.pinTarget === undefined,
+        JSON.stringify(stablePin && { betaPin: stablePin.betaPin, hint: stablePin.prereleaseHint, target: stablePin.pinTarget })
+      );
+
+      // PR-Durchlauf mit demselben Ziel: Manifest + Body + Titel.
+      const pkgJson = `${JSON.stringify({ name: 'beta-demo', dependencies: { payload: '4.0.0-beta.7' } }, null, 2)}\n`;
+      const pr = await runPr(
+        { files: { 'package.json': pkgJson, 'package-lock.json': LOCK }, regen: () => ({ content: `${LOCK} ` }) },
+        [
+          finding('payload', '4.0.0-beta.7', '4.0.0', {
+            betaPin: true,
+            pinTarget: '4.0.0-beta.9',
+            pinTargetKind: 'beta',
+            eligibility: 'eligible',
+            eligibilityLabel: 'reif (3d)',
+          }),
+        ]
+      );
+      const manifest = pr.rec.puts.find((p) => p.path === 'package.json')?.content ?? '';
+      check('B12 PR schreibt beta.9 ins Manifest', /"payload": "4\.0\.0-beta\.9"/.test(manifest), manifest.trim());
+      const body = pr.rec.prBodies[0] ?? '';
+      check('B13 PR-Body nennt Beta-Kanal-Update (beta → beta)', /Beta\/RC channel updates/.test(body) && /beta → beta/.test(body));
+      check('B14 kein [skip ci] im Beta-Pins-PR', pr.rec.puts.every((p) => !/\[skip (ci|cd)\]/i.test(p.message)));
+
+      // Zu junges Beta → Report, aber KEIN PR-Kandidat (Soaking).
+      const youngRec: PinTestRecorder = { puts: [], prBodies: [], prDrafts: [] };
+      const young = await collectPinning(
+        REPO,
+        dir,
+        fakeDeps(
+          { registry, published: { '@payloadcms/db-postgres@4.0.0-beta.9': new Date().toISOString() } },
+          youngRec
+        )
+      );
+      const youngDb = young.findings.find((f) => f.pkg === '@payloadcms/db-postgres');
+      check(
+        'B15 zu junges Beta: Ziel im Report, nicht fixable',
+        youngDb?.pinTarget === '4.0.0-beta.9' &&
+          youngDb.eligibility === 'too-young' &&
+          !young.fixable.some((f) => f.pkg === '@payloadcms/db-postgres'),
+        `${youngDb?.eligibility}`
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   }
 
   // ————————————————————————— Manifest-Version in der Sandbox —————————————————————————
