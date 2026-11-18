@@ -175,6 +175,8 @@ export interface PinDeps {
   ) => Promise<{ number: number; url: string }>;
   /** Branch von einem Commit-SHA anlegen. */
   createRef: (repo: string, branch: string, sha: string) => Promise<'created' | 'ref-exists'>;
+  /** Branch löschen (Crash-Rest ohne offenen PR; 404 = schon weg, ok). */
+  deleteRef: (repo: string, branch: string) => Promise<void>;
   /** Default-Branch-Head-SHA. */
   headSha: (repo: string, defaultBranch: string) => Promise<string>;
   /** Offener PR für die Branch → Nummer + URL oder null. */
@@ -209,6 +211,7 @@ export function pinDeps(): PinDeps {
       return { number: pr.number, url: pr.html_url };
     },
     createRef: (repo, branch, sha) => tryCreateRef(repo, branch, sha),
+    deleteRef: (repo, branch) => deleteRef(repo, branch),
     headSha: async (repo, defaultBranch) => {
       const ref = await ghJson<{ object: { sha: string } }>(
         `/repos/${OWNER}/${repo}/git/ref/heads/${defaultBranch}`
@@ -900,11 +903,18 @@ export async function createPinsPr(
     if (open) return { status: 'exists', prUrl: open.url, prNumber: open.number, branch };
 
     const headSha = await deps.headSha(repo.name, repo.defaultBranch);
-    const created = await deps.createRef(repo.name, branch, headSha);
+    let created = await deps.createRef(repo.name, branch, headSha);
     if (created === 'ref-exists') {
       const openNow = await deps.findOpenPr(repo.name, branch);
       if (openNow) return { status: 'exists', prUrl: openNow.url, prNumber: openNow.number, branch };
-      log(`Pins-PR ${repo.name}: Branch ${branch} existiert ohne offenen PR — update fort.`);
+      // Crash-Rest (v1.8.1): Branch ohne PR → neu aufsetzen, sonst bliebe
+      // `changed` false und der PR entstünde nie (Vorfall 18.11.2026).
+      log(`Pins-PR ${repo.name}: Branch ${branch} existiert ohne offenen PR — wird neu aufgesetzt.`);
+      await deps.deleteRef(repo.name, branch);
+      created = await deps.createRef(repo.name, branch, headSha);
+      if (created === 'ref-exists') {
+        return { status: 'failed', branch, note: `Branch ${branch} ließ sich nicht neu aufsetzen` };
+      }
     }
 
     const bumped: string[] = [];
@@ -1069,6 +1079,26 @@ async function tryCreateRef(repo: string, branch: string, sha: string): Promise<
   const body = await res.text();
   if (res.status === 422 && /exists/i.test(body)) return 'ref-exists';
   throw new Error(`ref-create ${res.status}: ${body.slice(0, 200)}`);
+}
+
+/**
+ * Crash-Rest aufräumen (v1.8.1): Starb der Lauf zwischen `createRef` und
+ * `createPr` (nativer V8-Abbruch, siehe scan-wrapper.sh), blieb ein Branch
+ * ohne PR zurück. Beim nächsten Lauf ist `changed` dann false (die Pins stehen
+ * schon auf dem Branch) und der PR würde NIE entstehen. Deshalb: Branch ohne
+ * offenen PR wird gelöscht und frisch vom aktuellen Base-Head aufgesetzt —
+ * die Pins werden deterministisch neu angewendet.
+ */
+async function deleteRef(repo: string, branch: string): Promise<void> {
+  const res = await ghFetch(
+    `/repos/${OWNER}/${repo}/git/refs/heads/${encodeURIComponent(branch)}`,
+    { method: 'DELETE' }
+  );
+  // 404 = schon weg (idempotent). Andere Fehler (403/422) sind echt und
+  // sollen den PR-Pfad als 'failed' melden, nicht still weiterlaufen.
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`ref-delete ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  }
 }
 
 function pinsPrBody(

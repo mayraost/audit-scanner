@@ -58,12 +58,16 @@ export interface PinTestFakes {
   /** Kandidaten, für die der Regen fehlschlagen soll (pkg-Namen). */
   regenFailsFor?: string[];
   pr?: 'created' | 'fail';
+  /** Crash-Rest: erster createRef liefert 'ref-exists' (Branch ohne PR). */
+  refExists?: boolean;
 }
 
 export interface PinTestRecorder {
   puts: Array<{ path: string; message: string; content: string }>;
   prBodies: string[];
   prDrafts: boolean[];
+  /** v1.8.1: gelöschte Crash-Rest-Branches (deleteRef-Aufrufe). */
+  deletedRefs: string[];
 }
 
 const REPO = {
@@ -84,6 +88,7 @@ export function fakeDeps(
 ): PinDeps {
   const files = { ...(f.files ?? {}) };
   const reg = f.registry ?? {};
+  let refExistsSeen = false;
   const packument = (pkg: string) => {
     const p = reg[pkg];
     if (!p) return Promise.resolve(null);
@@ -124,7 +129,17 @@ export function fakeDeps(
       rec.prDrafts.push(o.draft);
       return { number: 42, url: 'https://github.com/mayraost/demo-repo/pull/42' };
     },
-    createRef: async () => 'created',
+    createRef: async () => {
+      // Crash-Rest-Simulation: genau der erste Aufruf findet den Branch vor.
+      if (f.refExists && !refExistsSeen) {
+        refExistsSeen = true;
+        return 'ref-exists';
+      }
+      return 'created';
+    },
+    deleteRef: async (_repo, branch) => {
+      rec.deletedRefs.push(branch);
+    },
     headSha: async () => 'deadbeef',
     findOpenPr: async () => null,
   };
@@ -149,7 +164,7 @@ function finding(pkg: string, current: string, latest: string, extra: Partial<Pi
  * explizit vorab gesetzt, damit der PR-Pfad isoliert testbar bleibt.
  */
 async function runPr(f: PinTestFakes, findings: PinFinding[]): Promise<{ rec: PinTestRecorder; result: Awaited<ReturnType<typeof createPinsPr>> }> {
-  const rec: PinTestRecorder = { puts: [], prBodies: [], prDrafts: [] };
+  const rec: PinTestRecorder = { puts: [], prBodies: [], prDrafts: [], deletedRefs: [] };
   const state: State = { prs: {} };
   const result = await createPinsPr(REPO, findings, state, fakeDeps(f, rec));
   return { rec, result };
@@ -540,7 +555,7 @@ export async function pinningTest(): Promise<number> {
         },
         lodash: { latest: '4.18.1', versions: { '4.18.1': {} } },
       };
-      const rec: PinTestRecorder = { puts: [], prBodies: [], prDrafts: [] };
+      const rec: PinTestRecorder = { puts: [], prBodies: [], prDrafts: [], deletedRefs: [] };
       const pin = await collectPinning(REPO, dir, fakeDeps({ registry }, rec));
       const db = pin.findings.find((f) => f.pkg === '@payloadcms/db-postgres');
       check(
@@ -608,7 +623,7 @@ export async function pinningTest(): Promise<number> {
       check('B14 kein [skip ci] im Beta-Pins-PR', pr.rec.puts.every((p) => !/\[skip (ci|cd)\]/i.test(p.message)));
 
       // Zu junges Beta → Report, aber KEIN PR-Kandidat (Soaking).
-      const youngRec: PinTestRecorder = { puts: [], prBodies: [], prDrafts: [] };
+      const youngRec: PinTestRecorder = { puts: [], prBodies: [], prDrafts: [], deletedRefs: [] };
       const young = await collectPinning(
         REPO,
         dir,
@@ -628,6 +643,27 @@ export async function pinningTest(): Promise<number> {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  }
+
+  // ————————————————————————— Crash-Rest (v1.8.1) —————————————————————————
+  // Der Lauf starb zwischen createRef und createPr (nativer V8-Abbruch): der
+  // Branch existiert ohne offenen PR. Ohne Neuaufsetzen bliebe `changed` false
+  // und der PR entstünde nie (Vorfall 18.11.2026, 4 Repos).
+  {
+    const pkgJson = `${JSON.stringify({ name: 'crash-demo', dependencies: { lodash: '^4.17.0' } }, null, 2)}\n`;
+    const pr = await runPr(
+      {
+        files: { 'package.json': pkgJson, 'package-lock.json': LOCK },
+        regen: () => ({ content: `${LOCK} ` }),
+        refExists: true,
+      },
+      [finding('lodash', '4.17.0', '4.17.21')]
+    );
+    check(
+      'R1 Crash-Rest-Branch ohne PR → gelöscht, neu aufgesetzt, PR entsteht',
+      pr.result.status === 'created' && pr.rec.deletedRefs.length === 1,
+      `${pr.result.status}, deleted=${pr.rec.deletedRefs.join(',')}`
+    );
   }
 
   // ————————————————————————— Manifest-Version in der Sandbox —————————————————————————

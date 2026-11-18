@@ -585,6 +585,15 @@ Wrapper reagiert darauf:
 - Jeder Lauf loggt `Speicher: RSS-Peak ≈ … MB` (plus Warnung ab 1 GB) — die
   Zeile zeigt beim nächsten Crash, ob Speicherdruck im Spiel war.
 
+**Crash-Rest-Aufräumen (v1.8.1):** Stirbt der Lauf zwischen `createRef` und
+`createPr`, bleibt ein `cve-audit/*-<datum>`-Branch **ohne PR** zurück (genau
+das passierte am 18.11.2026 in 4 Repos). Beim nächsten Lauf wäre `changed`
+false — die Pins stehen ja schon auf dem Branch — und der PR entstünde nie.
+Pins-, Fix- und Image-PR-Pfad löschen einen solchen Branch deshalb und setzen
+ihn frisch vom aktuellen Base-Head auf; die Pins werden deterministisch neu
+angewendet. Ein `deleteRef`-Fehler (≠ 404) meldet den PR als `failed`, statt
+still zu überspringen.
+
 Status/Log nach dem Lauf:
 
 ```sh
@@ -657,7 +666,7 @@ Kompakte Release-Historie (git history; Version in package.json):
 | v1.7.6 | Telegram-Retry (3×, 1 s/3 s/7 s) + Alarm-Merker erst nach Erfolg; HEALTHCHECK 26 h statt 48 h |
 | v1.7.7 | Crash-Diagnose: `NODE_OPTIONS=--report-on-signal --report-signal=SIGSEGV` → Diagnose-Report in `/app/logs` |
 | v1.8.0 | Beta-Kanal-PRs: Pakete bereits im Beta/RC-Kanal werden im Pins-PR gebumpt (`beta → beta` / `beta → stable`), nie `stable → beta`; Soaking gilt auch für Beta-Ziele |
-| v1.8.1 | Crash-Resilienz: Wrapper wiederholt native V8-Abbrüche (rc 133/134/139) genau einmal, solange kein Report geschrieben wurde; `--report-on-fatalerror`; RSS-Peak im Log; Alarm-Hinweis 26 h statt 48 h |
+| v1.8.1 | Crash-Resilienz: Wrapper wiederholt native V8-Abbrüche (rc 133/134/139) genau einmal, solange kein Report geschrieben wurde; `--report-on-fatalerror`; RSS-Peak im Log; Alarm-Hinweis 26 h statt 48 h; Branch-ohne-PR-Crash-Rest wird neu aufgesetzt (Pins/Fix/Image) |
 
 ## Tests & Sicherheit
 
@@ -677,7 +686,9 @@ Kompakte Release-Historie (git history; Version in package.json):
   (Draft + `⚠️ NOT applied`), Lockfile-Commit vor Manifest-Commit, keine
   `[skip ci]`-Marker, Image-Tag-Präfix-Flip für Docker Hub/MCR/Quay,
   „kein Image" nur bei belastbarer Probe, Beta-Kanal-Ziele
-  (`beta → beta`, `beta → stable`, kein `stable → beta`, Soaking).
+  (`beta → beta`, `beta → stable`, kein `stable → beta`, Soaking) sowie
+  (v1.8.1) `R1` Crash-Rest: Branch ohne offenen PR wird gelöscht, neu
+  aufgesetzt und der PR entsteht trotzdem.
 - `renovate-test` (v1.7.0) — Renovate-Analyse **offline**: eingebettetes
   JSONL-Fixture in der echten Log-Form (`msg: "packageFiles with updates"`,
   Update-Daten unter `config`) prüft Parser (nur deps mit `updates[]`, höchste

@@ -864,7 +864,13 @@ export async function createImagePr(repo: RepoInfo, bumpPlan: ImageBumpPlan[], s
     if (created === 'ref-exists') {
       const openNow = await findOpenImagePr(repo.name, branch);
       if (openNow) return { status: 'exists', prUrl: openNow.url, prNumber: openNow.number, branch };
-      log(`Image-PR ${repo.name}: Branch ${branch} existiert ohne offenen PR — update fort.`);
+      // Crash-Rest (v1.8.1): Branch ohne PR → neu aufsetzen, sonst bliebe der
+      // Image-PR für immer aus (Lauf starb zwischen createRef und createPr).
+      log(`Image-PR ${repo.name}: Branch ${branch} existiert ohne offenen PR — wird neu aufgesetzt.`);
+      await deleteRef(repo.name, branch);
+      if ((await tryCreateRef(repo.name, branch, ref.object.sha)) === 'ref-exists') {
+        return { status: 'failed', branch, note: `Branch ${branch} ließ sich nicht neu aufsetzen` };
+      }
     }
 
     const bumps: string[] = [];
@@ -951,6 +957,21 @@ async function tryCreateRef(repo: string, branch: string, sha: string): Promise<
   const body = await res.text();
   if (res.status === 422 && /exists/i.test(body)) return 'ref-exists';
   throw new Error(`ref-create ${res.status}: ${body.slice(0, 200)}`);
+}
+
+/**
+ * Crash-Rest aufräumen (v1.8.1): Branch ohne offenen PR (Lauf starb zwischen
+ * createRef und createPr) → löschen, damit der PR-Pfad ihn frisch aufsetzt.
+ * 404 = schon weg (idempotent).
+ */
+async function deleteRef(repo: string, branch: string): Promise<void> {
+  const res = await ghFetch(
+    `/repos/${OWNER}/${repo}/git/refs/heads/${encodeURIComponent(branch)}`,
+    { method: 'DELETE' }
+  );
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`ref-delete ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  }
 }
 
 /**
