@@ -9,14 +9,23 @@ ok(){ PASS=$((PASS+1)); echo "OK   $1"; }
 no(){ FAIL=$((FAIL+1)); echo "FAIL $1"; }
 
 setup() {
-  unset NODE_SCAN_RC NODE_NOTIFY_RC 2>/dev/null || true
+  unset NODE_SCAN_RC NODE_NOTIFY_RC SCAN_SEQ FAKE_HB_TOUCH 2>/dev/null || true
   rm -rf "$ROOT"; mkdir -p "$ROOT/logs" "$ROOT/reports" "$ROOT/bin"
   CALLS="$ROOT/calls.txt"; : > "$CALLS"; export CALLS
+  SCAN_SEQ="$ROOT/scan.seq"; : > "$SCAN_SEQ"; export SCAN_SEQ
   cat > "$ROOT/bin/node" <<'EOF'
 #!/bin/sh
 # Fake-node: unterscheidet per Subcommand (letztes Argument vor den Flags).
+# SCAN_SEQ: Datei mit rc-Werten, je Lauf die erste Zeile (Wiederholungs-Tests).
+# FAKE_HB_TOUCH: Datei, die der "Scan" vor dem Exit toucht (Report geschrieben).
 case "$*" in
   *"index.js scan")
+    [ -n "${FAKE_HB_TOUCH:-}" ] && touch "$FAKE_HB_TOUCH"
+    if [ -n "${SCAN_SEQ:-}" ] && [ -s "$SCAN_SEQ" ]; then
+      s_rc=$(sed -n 1p "$SCAN_SEQ")
+      sed -e '1d' "$SCAN_SEQ" > "$SCAN_SEQ.tmp" && mv "$SCAN_SEQ.tmp" "$SCAN_SEQ"
+      echo "[fake] scan läuft (seq rc=$s_rc)"; exit "$s_rc"
+    fi
     echo "[fake] scan läuft"; exit "${NODE_SCAN_RC:-0}" ;;
   *" notify-failure "*)
     echo "NOTIFY $(printf '%s' "$*" | sed 's#.*notify-failure ##')" >> "$CALLS"
@@ -29,7 +38,7 @@ EOF
       -e "s#/app/dist/index.js#$ROOT/dist/index.js#g" "$W" > "$ROOT/wrap.sh"
   chmod +x "$ROOT/wrap.sh"
 }
-go() { NODE_SCAN_RC="${1:-0}" PATH="$ROOT/bin:$PATH" "$ROOT/wrap.sh" >"$ROOT/out.log" 2>&1; local_r=$?; echo "$local_r"; }
+go() { NODE_SCAN_RC="${1:-0}" RETRY_DELAY_SECONDS=0 PATH="$ROOT/bin:$PATH" "$ROOT/wrap.sh" >"$ROOT/out.log" 2>&1; local_r=$?; echo "$local_r"; }
 
 # 1) Erfolg
 setup
@@ -98,6 +107,34 @@ rc=$(go 3)
 n=$(wc -l < "$CALLS")
 [ "$n" = "1" ] && ok "Alter Merker: Alarm kommt trotzdem" || no "Alter Merker: $n Alarme (unterdrückt!)"
 [ "$rc" = "3" ] && ok "Alter Merker: rc=3" || no "Alter Merker: rc=$rc"
+
+# 6) Nativer V8-Crash (133 = SIGTRAP) → genau EINE Wiederholung, danach Erfolg
+setup; printf '133\n0\n' > "$SCAN_SEQ"
+rc=$(go 133)
+n=$(wc -l < "$CALLS")
+[ "$rc" = "0" ] && ok "Crash 133: Wiederholung rettet den Lauf (rc=0)" || no "Crash 133: rc=$rc (erwartet 0)"
+[ "$n" = "0" ] && ok "Crash 133: KEIN Alarm (Wiederholung erfolgreich)" || no "Crash 133: $n Alarme"
+grep -q "NATIVE-CRASH rc=133" "$ROOT/out.log" && ok "Crash 133: Wiederholung geloggt" || no "Crash 133: kein Log-Eintrag"
+grep -q "scan ok (nach Wiederholung)" "$ROOT/out.log" && ok "Crash 133: Erfolg quittiert" || no "Crash 133: kein Erfolgs-Log"
+[ -f "$ROOT/reports/.heartbeat" ] && ok "Crash 133: Heartbeat gesetzt" || no "Crash 133: Heartbeat fehlt"
+
+# 7) Zwei native Crashes → Alarm MIT Grund, rc bleibt der des 2. Laufs
+setup; printf '133\n139\n' > "$SCAN_SEQ"
+rc=$(go 133)
+n=$(wc -l < "$CALLS")
+[ "$rc" = "139" ] && ok "Crash 2×: rc des 2. Laufs (139) bleibt" || no "Crash 2×: rc=$rc (erwartet 139)"
+[ "$n" = "1" ] && ok "Crash 2×: genau 1 Alarm" || no "Crash 2×: $n Alarme"
+grep -q "V8-Abbruch" "$CALLS" && ok "Crash 2×: Alarm nennt den Grund" || no "Crash 2×: kein --reason mit V8-Grund"
+grep -q "Wiederholung ebenfalls gescheitert" "$ROOT/out.log" && ok "Crash 2×: 2. Lauf geloggt" || no "Crash 2×: 2. Lauf nicht geloggt"
+
+# 8) Crash NACH dem Report (Heartbeat frisch getoucht) → KEINE Wiederholung
+setup; printf '133\n' > "$SCAN_SEQ"
+FAKE_HB_TOUCH="$ROOT/reports/.heartbeat" RETRY_DELAY_SECONDS=0 PATH="$ROOT/bin:$PATH" \
+  "$ROOT/wrap.sh" >"$ROOT/out.log" 2>&1; rc=$?
+n=$(wc -l < "$CALLS")
+[ "$rc" = "133" ] && ok "Crash nach Report: rc=133" || no "Crash nach Report: rc=$rc"
+[ "$n" = "1" ] && ok "Crash nach Report: 1 Alarm" || no "Crash nach Report: $n Alarme"
+grep -q "keine Wiederholung" "$ROOT/out.log" && ok "Crash nach Report: KEINE Wiederholung" || no "Crash nach Report: doch wiederholt"
 
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = "0" ] || exit 1

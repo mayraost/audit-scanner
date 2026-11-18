@@ -90,6 +90,20 @@ echo "=== scan start $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
 # gesetzt — ein gescheiterter Alarm wird vom EXIT-trap einmal wiederholt.
 # Der Heartbeat bleibt im Fehlerfall bewusst unangetastet — erst dann flippt
 # der HEALTHCHECK nach 26 h ohne Erfolgslauf auf unhealthy.
+hb_mtime() { stat -c %Y "$REPORTS_DIR/.heartbeat" 2>/dev/null || echo 0; }
+
+# Crash-Resilienz (v1.8.1): Ein nativer V8-Abbruch ist prozessweit tödlich,
+# aber nicht reproduzierbar und liegt NICHT in unserem JS-Code — Vorfall
+# 14.11.2026 (rc=139, SIGSEGV) und 18.11.2026 (rc=133, SIGTRAP:
+# `Check failed: page_->ContainsLimit(...)` in einem V8-Worker-Thread, also
+# Heap-/GC-Interna). Solange der Lauf noch KEINEN Report geschrieben hat
+# (Heartbeat-mtime unverändert), wird er genau EINMAL wiederholt. Das ist
+# idempotent: Fix-/Pins-/Image-PRs werden über den Branch-Namen dedupliziert
+# (`cve-audit/*-<datum>` → findOpenPr → status 'exists', kein Duplikat).
+RETRY_DELAY_SECONDS="${RETRY_DELAY_SECONDS:-5}"
+NATIVE_CRASH_CODES="133 134 139" # SIGTRAP (V8-CHECK/Fatal), SIGABRT, SIGSEGV
+
+hb_before=$(hb_mtime)
 if node /app/dist/index.js scan; then
   touch "$REPORTS_DIR/.heartbeat"
   # Erfolg quittiert den Alarm-Merker, damit der EXIT-trap nicht feuert.
@@ -97,10 +111,33 @@ if node /app/dist/index.js scan; then
   echo "=== scan ok $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
   exit 0
 else
+  # rc MUSS im else-Zweig gelesen werden: ein `if` ohne else liefert selbst 0.
   rc=$?
-  echo "=== scan FAILED rc=$rc $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
-  # Merker VOR dem Versand setzen: sendet der Alarm, quittiert er den trap;
-  # scheitert er, soll der trap nicht ein zweites Mal senden.
-  send_alarm "$rc" ""
-  exit "$rc"
 fi
+first_rc=$rc
+echo "=== scan FAILED rc=$rc $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
+
+case " $NATIVE_CRASH_CODES " in
+  *" $rc "*)
+    if [ "$(hb_mtime)" -le "$hb_before" ]; then
+      echo "=== scan NATIVE-CRASH rc=$rc — Wiederholung nach ${RETRY_DELAY_SECONDS}s $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
+      sleep "$RETRY_DELAY_SECONDS" 2>/dev/null || true
+      hb_before=$(hb_mtime)
+      if node /app/dist/index.js scan; then
+        touch "$REPORTS_DIR/.heartbeat"
+        : > "$ALARM_MARKER" 2>/dev/null || true
+        echo "=== scan ok (nach Wiederholung) $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
+        exit 0
+      else
+        rc=$?
+      fi
+      echo "=== scan FAILED rc=$rc (Wiederholung ebenfalls gescheitert) $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
+      send_alarm "$rc" "nativer V8-Abbruch (erster Lauf rc=$first_rc), Wiederholung ebenfalls gescheitert (rc=$rc)"
+      exit "$rc"
+    fi
+    echo "=== scan NATIVE-CRASH rc=$rc — keine Wiederholung: Report/Heartbeat wurde bereits geschrieben ==="
+    ;;
+esac
+
+send_alarm "$rc" ""
+exit "$rc"

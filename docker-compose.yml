@@ -24,7 +24,10 @@ services:
       # ACHTUNG: --report-on-signal allein installiert KEINEN Handler — ohne
       # explizites --report-signal bleibt der Report aus (SIGUSR2 ist nur der
       # Default-Wert, nicht der Auslöser).
-      NODE_OPTIONS: "${NODE_OPTIONS:---report-on-signal --report-signal=SIGSEGV --report-directory=/app/logs}"
+      # v1.8.1: --report-on-fatalerror ergänzt — fängt V8-Fatal-Fehler/Heap-
+      # OOM ab, die NICHT über den Signal-Handler laufen (Vorfall 18.11.2026:
+      # rc=133/SIGTRAP, `page_->ContainsLimit` im V8-Worker → Report blieb aus).
+      NODE_OPTIONS: "${NODE_OPTIONS:---report-on-signal --report-signal=SIGSEGV --report-on-fatalerror --report-directory=/app/logs}"
       # Cron in Container-Zeit (TZ=Europe/Berlin im Image): 16:00 Ortszeit.
       CRON_SCHEDULE: ${CRON_SCHEDULE:-0 16 * * *}
       # Soaking: Updates erst nach N Tagen (Package-Poisoning-Schutz). 0 = aus.

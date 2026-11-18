@@ -130,7 +130,7 @@ export function renderFailureMessage(d: FailureDetails): string {
     '```',
     '',
     'Hinweis: Der Heartbeat wurde NICHT erneuert — der HEALTHCHECK flippt nach',
-    '48 h ohne Erfolgslauf auf unhealthy. Prüfen:',
+    '26 h ohne Erfolgslauf auf unhealthy. Prüfen:',
     '  docker exec <container> tail -50 /app/logs/scan.log',
   ].join('\n');
 }

@@ -30,6 +30,8 @@ keine Ports, keine Domain, reiner Batch-Job.
 - Report als `report.json`/`report.md`, neuer Tag je Tag-Verzeichnis
 - Telegram-Notify (nur bei neuen Findings oder offenen PRs)
 - Heartbeat + Docker-HEALTHCHECK (frisch getoucht < 26 h)
+- Crash-Resilienz (v1.8.1): native V8-Abbrüche (rc 133/134/139) → genau eine
+  Wiederholung im Wrapper, solange kein Report geschrieben wurde
 
 ## Inhaltsverzeichnis
 
@@ -471,7 +473,7 @@ Lokal ohne Docker braucht ein voller `scan` zusätzlich `trivy` im PATH.
 | `ENABLE_RENOVATE` | nein | `0` | `1` = Renovate-CLI als **Analyse-Quelle** mitlaufen lassen. Renovate legt **nie** eigene PRs an; seine Vorschläge landen gebündelt im `cve-audit/pins-<datum>`-PR. |
 | `RENOVATE_BIN` | nein | `renovate` | Pfad zum Renovate-Binary (im Image global installiert, exakt gepinnt). |
 | `RENOVATE_TIMEOUT_MS` | nein | `120000` | Timeout je Repo für den Renovate-Lauf (`--dry-run=lookup`). Timeout/Exit≠0 ⇒ Repo ohne Renovate-Vorschläge, Pinning-Scan läuft weiter. |
-| `NODE_OPTIONS` | nein | `--report-on-signal --report-signal=SIGSEGV --report-directory=/app/logs` | **Crash-Diagnose** (v1.7.7): Node schreibt bei SIGSEGV einen Diagnose-Report nach `/app/logs/report.<datum>.<pid>.<seq>.json` (header.event, JS-Heap, native Frames, Env, libuv-Handles). Nur `--report-on-signal` ohne `--report-signal` installiert **keinen** Handler — der Report bleibt dann aus. Leer setzen (`NODE_OPTIONS=`) schaltet die Diagnose ab. |
+| `NODE_OPTIONS` | nein | `--report-on-signal --report-signal=SIGSEGV --report-on-fatalerror --report-directory=/app/logs` | **Crash-Diagnose** (v1.7.7, erweitert v1.8.1): Node schreibt bei SIGSEGV (und seit v1.8.1 auch bei V8-Fatal/OOM) einen Diagnose-Report nach `/app/logs/report.<datum>.<pid>.<seq>.json` (header.event, JS-Heap, native Frames, Env, libuv-Handles). Nur `--report-on-signal` ohne `--report-signal` installiert **keinen** Handler — der Report bleibt dann aus. Leer setzen (`NODE_OPTIONS=`) schaltet die Diagnose ab. |
 
 **Item-Level-Skip**: Datei `.cve-audit-skip` im Repo-Root (wird im Inventar
 erkannt; Repo erscheint als `skip(repo-file)`). **`SKIP_REPOS`** klammert Repos
@@ -560,6 +562,29 @@ von Erfolg **oder** erfolgreich versendetem Fehlschlag-Alarm gesetzt wird
 (seit v1.7.6 erst nach dem Versand — ein gescheiterter Versand lässt den
 `EXIT`-trap einmal wiederholen).
 
+**Crash-Resilienz (v1.8.1, Vorfälle 14.11./18.11.2026):** Zweimal starb der
+Scanner-Prozess **nativ** — `rc=139` (SIGSEGV) bzw. `rc=133` (SIGTRAP,
+`Check failed: page_->ContainsLimit(object_address + current_size_)` in einem
+V8-Worker-Thread). Beides sind V8-Heap-/GC-Interna, kein JS-Fehler. Am selben
+Host crashten im selben Zeitraum auch fremde Prozesse (php/libcrypto mit
+General-Protection-Fault, ein weiterer `MainThread` mit Reserved-Bit-Pagefault)
+— das Muster spricht für Host-/RAM-Instabilität, nicht für Scanner-Code. Der
+Wrapper reagiert darauf:
+
+- rc `133`/`134`/`139` **und** Heartbeat unverändert (Lauf starb vor dem
+  Report) → genau **eine** Wiederholung (`RETRY_DELAY_SECONDS`, Default 5 s).
+  Idempotent, weil Fix-/Pins-/Image-PRs über den Branch-Namen dedupliziert
+  werden (`cve-audit/*-<datum>` → `findOpenPr` → `status 'exists'`).
+- Heartbeat schon frisch getoucht (Crash **nach** dem Report) → **keine**
+  Wiederholung, sonst gäbe es ein Doppel-Telegram.
+- Scheitert auch die Wiederholung, geht der Alarm mit `--reason`
+  („nativer V8-Abbruch …“) raus.
+- `NODE_OPTIONS` enthält zusätzlich `--report-on-fatalerror` (V8-Fatal/OOM
+  läuft nicht über den Signal-Handler; der SIGTRAP-Vorfall hinterliess deshalb
+  keinen Diagnose-Report).
+- Jeder Lauf loggt `Speicher: RSS-Peak ≈ … MB` (plus Warnung ab 1 GB) — die
+  Zeile zeigt beim nächsten Crash, ob Speicherdruck im Spiel war.
+
 Status/Log nach dem Lauf:
 
 ```sh
@@ -632,6 +657,7 @@ Kompakte Release-Historie (git history; Version in package.json):
 | v1.7.6 | Telegram-Retry (3×, 1 s/3 s/7 s) + Alarm-Merker erst nach Erfolg; HEALTHCHECK 26 h statt 48 h |
 | v1.7.7 | Crash-Diagnose: `NODE_OPTIONS=--report-on-signal --report-signal=SIGSEGV` → Diagnose-Report in `/app/logs` |
 | v1.8.0 | Beta-Kanal-PRs: Pakete bereits im Beta/RC-Kanal werden im Pins-PR gebumpt (`beta → beta` / `beta → stable`), nie `stable → beta`; Soaking gilt auch für Beta-Ziele |
+| v1.8.1 | Crash-Resilienz: Wrapper wiederholt native V8-Abbrüche (rc 133/134/139) genau einmal, solange kein Report geschrieben wurde; `--report-on-fatalerror`; RSS-Peak im Log; Alarm-Hinweis 26 h statt 48 h |
 
 ## Tests & Sicherheit
 
@@ -669,6 +695,11 @@ Kompakte Release-Historie (git history; Version in package.json):
   `variantDrift`, `strictlyNewer`-Invariante (semver-gleich = false) und
   „pinned never DOWN into floating“.
 - `triage-test` — LLM-Triage mit 2 Fake-Findings (kein Scan, kein Telegram).
+- `wrapper-test` (`sh test/scan-wrapper-test.sh`, Fake-`node`) — Wrapper-Pfade
+  ohne echten Scan: Erfolg/Fehlschlag, Alarm genau einmal, Retry-Verhalten bei
+  `notify-failure`-Fehlern, SIGTERM-Abbruch mit `--reason`, alter Merker und
+  (v1.8.1) native V8-Crashes: rc 133 → genau eine Wiederholung, 133+139 →
+  Alarm mit Grund, Crash **nach** dem Report → keine Wiederholung.
 - `test-telegram` — 1 Config-Testnachricht (à la Smoke-Test) an den
   konfigurierten Chat.
 - TypeScript strict-tsconfig (`strict`, `noUncheckedIndexedAccess`,

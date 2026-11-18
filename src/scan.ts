@@ -220,6 +220,24 @@ export async function runScan(opts: {
   }
 
   const results: RepoResult[] = [];
+  // Speicher-Beobachtung (v1.8.1): Der native V8-Abbruch vom 18.11.2026
+  // (rc=133, `page_->ContainsLimit` im V8-Worker) hinterliess keinen Report.
+  // Diese Zeilen machen beim nächsten Vorfall sichtbar, ob Speicherdruck im
+  // Spiel war — bewusst billig (nur process.memoryUsage(), keine Heap-Snapshots).
+  const RSS_WARN_BYTES = 1024 * 1024 * 1024; // 1 GB
+  const rssStart = process.memoryUsage().rss;
+  let rssMax = rssStart;
+  let rssLastWarn = 0;
+  const noteRss = (label: string): void => {
+    const rss = process.memoryUsage().rss;
+    if (rss > rssMax) rssMax = rss;
+    // Erst ab 1 GB und dann nur bei +25 % erneut warnen (kein Log-Spam).
+    if (rss >= RSS_WARN_BYTES && rss >= rssLastWarn * 1.25) {
+      rssLastWarn = rss;
+      log(`WARN: RSS ${Math.round(rss / 1048576)} MB nach ${label} — Speicherdruck`);
+    }
+  };
+  const mb = (b: number): number => Math.round(b / 1048576);
   const scanTmp = tmpRoot();
   // Digest-Cache (v1.6.2): belegter Vergleich der Manifest-Digests je Ref
   // (beweglicher Tag vs. unveränderlicher Pin). Wird erst NACH erfolgreichem
@@ -309,10 +327,12 @@ export async function runScan(opts: {
         const failure: RepoResult = { ...res, status: 'error', note: msg.slice(0, 300), findings: [] };
         results.push(failure);
       }
+      noteRss(repo.name);
     }
   } finally {
     fs.rmSync(scanTmp, { recursive: true, force: true });
   }
+  log(`Speicher: RSS-Peak ≈ ${mb(rssMax)} MB (Start ${mb(rssStart)} MB) — ${results.length} Repos verarbeitet.`);
 
   // Digest-Cache persistieren (90-Tage-Prune + Write), nur wenn der Lauf bis
   // hierhin kam — Throws aus dem Loop landen gar nicht erst hier.
