@@ -4,9 +4,10 @@
 # rotieren) — gepinnt ist 0.76.2 (05.11.2026), bei Upgrade unten anpassen.
 # Trivy ist der Trust-Root der ganzen Audit-Pipeline → Tag UND Index-Digest
 # gepinnt (Tag-Re-Pointing würde fremden Scanner-Code einbauen).
-# ACHTUNG: digest-gepinnte Refs werden vom eigenen Image-Scan übersprungen
-# (image-scan.ts addRef: `digest-pinned — Freshness übersprungen`) — Trivy-
-# Updates dieses Images müssen daher manuell/über Renovate nachgezogen werden.
+# Seit v1.8.2 trackt der eigene Image-Scan Digest-Pins weiter: der TAG wird auf
+# Freshness geprüft und eine Tag-Mutation (gleicher Tag, anderer Digest) wird
+# gemeldet — der CVE-Scan des Digests bleibt aus (unveränderlich). Ein Trivy-
+# Bump kommt daher als Report-Fund, aber bewusst ohne Auto-PR.
 
 FROM node:26.13.1-alpine3.24 AS build
 WORKDIR /app

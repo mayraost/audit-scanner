@@ -6,8 +6,9 @@
 //   (Registry-API direkt, gemeinsamer DB-Cache), HIGH/CRITICAL-Zählung;
 //   private/404-Images graceful skip mit Note.
 // - Freshness-Check via Registry-Tag-Liste (Docker Hub / GHCR / MCR, anonymous
-//   token flow; MCR anonym ohne Auth-Header); digest-pinned / latest / invalid
-//   Tags → Skip mit Note.
+//   token flow; MCR anonym ohne Auth-Header); latest / invalid Tags → Skip mit
+//   Note. Digest-Pins (v1.8.2) laufen in einen eigenen Pfad: Tag-Freshness +
+//   Tag-Mutation ja, trivy-CVE-Scan nein (Digest unveränderlich), kein Auto-PR.
 // - Fix-PR-Policy (v1.5.0, AGENTS.md "Keine floating versions"):
 //   a) EXAKT gepinnte Tags (x.y.z) mit neuerer Version im selben Major → PR-Bump
 //      auf den neueren exakten Tag.
@@ -94,6 +95,28 @@ export interface ImageFinding {
   upstreamLatest?: string | null;
   /** v1.6.3: Klartext-Hinweis zum Release-Check (z. B. "… kein Image auf MCR (404)"). */
   upstreamNote?: string | null;
+  /**
+   * v1.8.2: Der Upstream-Release-Check hat einen ECHTEN neueren Release
+   * gefunden (`newerThanTag === true`). Nur dann wird `upstreamLatest` gesetzt —
+   * sonst entstand der False Positive "Release v0.76.2 existiert, kein Image
+   * publiziert" für ein Image, dessen Tag GENAU dem Release entspricht.
+   */
+  upstreamNewerThanTag?: boolean;
+  /**
+   * v1.8.2: Registry-Probe war belastbar 404 → das Release hat wirklich kein
+   * Image. NUR damit darf der Report "kein Image publiziert" behaupten.
+   */
+  upstreamReleaseWithoutImage?: boolean;
+  /** v1.8.2: Digest, der in der Datei steht (`image:tag@sha256:…`). */
+  pinnedDigest?: string | null;
+  /**
+   * v1.8.2: Derselbe Tag zeigt auf einen ANDEREN Digest als den gepinnten
+   * (Tag-Mutation). Bei Digest-Pins das eigentliche Signal — der Digest ist
+   * dann nicht mehr reproduzierbar, was er zu sein vorgibt.
+   */
+  tagMutated?: boolean;
+  /** v1.8.2: Klartext zum Digest-Lookup bei Digest-Pins (nur intern/Report). */
+  digestNote?: string | null;
 }
 
 /** Bump-Plan (je File): literal `${base}:${oldTag}` → `${base}:${newTag}`. */
@@ -672,6 +695,15 @@ export async function scanRepoImages(
   // trivy image sequential (DB-Download-LockContention vermeiden); frisch
   // installierte Container-DB ist gecacht, typisch ≤ 5 Images je Repo.
   for (const f of findings) {
+    // v1.8.2: Digest-Pins NICHT mehr komplett überspringen. Der CVE-Scan bleibt
+    // aus (Digest ist unveränderlich — trivy scannt den Stand, der im Digest
+    // steckt, und der ändert sich nie), aber Tag-Freshness und Tag-Mutation
+    // werden weiter getrackt. Vorher verschwanden trivy/pgvector/python/node-
+    // Digest-Pins lautlos aus dem Report.
+    if (f.digestPinned) {
+      await trackDigestPinnedFinding(f);
+      continue;
+    }
     const safe = f.image.replace(/[^A-Za-z0-9._\-/@:]/g, '_');
     if (f.note) continue; // latest/tagless/digest/invalid → kein Scan, Note bleibt stehen
     const outPath = path.join(scanTmp, `${repo.name}.img-${safe.replace(/[/:@]/g, '_')}.trivy.json`);
@@ -761,11 +793,18 @@ export async function scanRepoImages(
     // (playwright-mcp v0.0.84 released, MCR-Tag fehlt → 404). Bei Bump-Kandidaten
     // oben ist der Check überflüssig und kostet nur API-Calls. Fehler brechen
     // den Lauf nie: Felder bleiben null, nur Log.
+    //
+    // v1.8.2: `upstreamLatest` wird NUR bei einem ECHT neueren Release gesetzt.
+    // Vorher stand dort auch der Release-Tag, der dem Pin exakt entspricht
+    // (trivy 0.76.2 vs Release v0.76.2) — der Report las daraus "kein Image
+    // publiziert" (False Positive, täglich wiederholt).
     try {
       const rel = await upstreamReleaseCheck({ base: f.base, currentTag: f.current, registry: f.registry });
-      if (rel.latestRelease || rel.note) {
+      if (rel.newerThanTag) {
         f.upstreamLatest = rel.latestRelease;
         f.upstreamNote = rel.note ?? null;
+        f.upstreamNewerThanTag = true;
+        f.upstreamReleaseWithoutImage = rel.releaseWithoutImage === true;
       }
     } catch (err) {
       log(
@@ -774,6 +813,71 @@ export async function scanRepoImages(
     }
   }
   return { findings, bumpPlan };
+}
+
+/**
+ * Digest-Pin-Verdict (v1.8.2) — reine Funktion, offline testbar.
+ *
+ * `mutated` nur, wenn BEIDE Digests bekannt sind und sich unterscheiden. Ein
+ * fehlgeschlagener Lookup (`currentDigest === null`) ist ausdrücklich KEINE
+ * Mutation: sonst würde jeder Registry-Hiccup einen falschen Alarm auslösen.
+ */
+export function digestPinVerdict(
+  pinnedDigest: string | null | undefined,
+  currentDigest: string | null | undefined
+): { mutated: boolean; known: boolean } {
+  const a = (pinnedDigest ?? '').trim().toLowerCase();
+  const b = (currentDigest ?? '').trim().toLowerCase();
+  if (!b) return { mutated: false, known: false };
+  if (!a) return { mutated: false, known: true };
+  return { mutated: a !== b, known: true };
+}
+
+/**
+ * Digest-gepinnte Refs (v1.8.2): CVE-Scan bleibt aus (der Digest ist
+ * unveränderlich — trivy würde für immer denselben Stand prüfen), aber die
+ * Tag-Ebene wird weiter getrackt:
+ *
+ * 1. **Tag-Mutation**: derselbe Tag zeigt jetzt auf einen anderen Digest als
+ *    den gepinnten. Das ist bei Digest-Pins das eigentliche Warnsignal — der
+ *    Pin verspricht Reproduzierbarkeit und liefert sie nicht mehr (Registry
+ *    hat den Tag neu gedreht, z. B. Base-Image-Rebuild).
+ * 2. **Tag-Freshness**: gibt es im selben Major einen neueren Tag?
+ *
+ * Bewusst KEIN Auto-PR: ein Digest-Pin ist eine bewusste Reproduzierbarkeits-
+ * Entscheidung, kein Veraltungs-Befund. Der Report nennt das Ziel, der Mensch
+ * entscheidet (ein Bump bräuchte ohnehin einen neuen, verifizierten Digest).
+ */
+async function trackDigestPinnedFinding(f: ImageFinding): Promise<void> {
+  const cur = await imageDigest(f.base, f.current, f.registry);
+  f.digest = cur.digest;
+  f.digestNote = cur.note ?? null;
+  const verdict = digestPinVerdict(f.pinnedDigest, cur.digest);
+  f.tagMutated = verdict.mutated;
+
+  const { tags, note } = await fetchRegistryTags(f.base, f.registry);
+  if (!tags) {
+    f.note = note ?? 'keine Tag-Liste';
+    return;
+  }
+  const newest = newestSameMajorTag(f.current, tags);
+  const exact = newestExactTag(f.current, tags);
+  f.newestSameMajor = newest ?? exact;
+  f.exactPin = exact;
+  f.variantDrift = variantDriftTag(f.current, tags);
+  if (newest && strictlyNewer(f.current, newest)) {
+    f.updateAvailable = true;
+    const age = await imagePublishedAt(f.base, newest, f.registry);
+    const el = updateEligibility({
+      variantChange: false,
+      publishedAt: age.publishedAt,
+      cveFix: isSecurityToolBump(f.base),
+    });
+    f.newestPublishedAt = age.publishedAt;
+    f.eligibility = el.eligibility;
+    f.eligibilityLabel = el.label;
+    f.ageDays = el.ageDays;
+  }
 }
 
 /** Ref in den Dedupe-Index aufnehmen (sourceFiles mergen, once-Logik). */
@@ -794,8 +898,13 @@ function addRef(byKey: Map<string, ImageFinding>, ref: string, rel: string): voi
     return;
   }
   if (digest) {
-    byKey.set(ref, mkFinding(ref, base, tag, { ...sem, pinned: false, floating: false }, rel, true,
-      'digest-pinned — Freshness übersprungen (Digest an Ref)'));
+    // v1.8.2: KEINE Skip-Note mehr — Digest-Pins laufen in einen eigenen Pfad
+    // (trackDigestPinnedFinding): kein CVE-Scan, aber Tag-Freshness +
+    // Tag-Mutations-Erkennung. `note` würde den Fund sonst aus dem Report
+    // drücken (scan.ts rendert note-Zeilen als reine Info-Zeile).
+    const f = mkFinding(ref, base, tag, sem, rel, true);
+    f.pinnedDigest = digest;
+    byKey.set(ref, f);
     return;
   }
   if (!sem.valid) {
@@ -824,7 +933,7 @@ function mkFinding(
     current,
     registry: splitRef(image).registry,
     pinned: sem.pinned && !digestPinned,
-    floating: sem.floating,
+    floating: sem.floating && !digestPinned,
     digestPinned,
     sourceFiles: [rel],
     vulns: { high: 0, critical: 0 },

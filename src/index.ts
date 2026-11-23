@@ -6,14 +6,17 @@ import os from 'node:os';
 import path from 'node:path';
 import semver from 'semver';
 import {
+  digestPinVerdict,
   newestExactTag,
   newestSameMajorTag,
   replaceTag,
   isSecurityToolBump,
+  splitRef,
   strictlyNewer,
   tagSemantics,
   variantDriftTag,
 } from './image-scan.js';
+import { withManifestRetry } from './publish-dates.js';
 import { channelCompatible, classifyPrerelease } from './prerelease.js';
 import {
   latestStableRelease,
@@ -31,10 +34,12 @@ import { llmEnabled, triageFindings, type TriageInput } from './llm.js';
 import {
   IMAGE_VULN_TELEGRAM_MAX_LINES,
   collectImageVulnFindings,
+  digestPinStatusText,
   imageVulnAdvice,
   imageVulnLines,
   novelImageVulns,
   runScan,
+  shortDigest,
   telegramBody,
   upstreamNewerOnly,
   type Report,
@@ -538,6 +543,37 @@ async function imageFreshnessTest(): Promise<number> {
   const pgTags2 = ['0.8.7-pg17', '0.8.7-pg17-bookworm', '0.8.7-pg17-trixie'];
   const pgDrift2 = variantDriftTag('0.8.7-pg17', pgTags2);  check('variantDriftTag erkennt echte OS-Drift', pgDrift2 !== null && pgDrift2 !== '0.8.7-pg17', `drift=${pgDrift2 ?? 'null'}`);
 
+  // 9) v1.8.2: Digest-Pins (image:tag@sha256:…) behalten die Tag-Freshness.
+  //    Vorher wurden sie komplett übersprungen → trivy/pgvector/python/node-
+  //    Digest-Pins verschwanden lautlos aus dem Update-Report.
+  const pinRef = splitRef('aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb');
+  check(
+    'digest-Pin: base/tag/digest korrekt getrennt',
+    pinRef.base === 'aquasec/trivy' && pinRef.tag === '0.76.2' && pinRef.digest?.startsWith('sha256:8f6bb947') === true,
+    `${pinRef.base}|${pinRef.tag}|${String(pinRef.digest).slice(0, 16)}…`
+  );
+  check(
+    'digest-Pin: Tag-Freshness nutzt den TAG (nicht den Digest)',
+    newestSameMajorTag(pinRef.tag!, ['0.76.1', '0.76.2', '0.76.3']) === '0.76.3'
+  );
+  const nodePin = splitRef('node:26.13.0-alpine3.24@sha256:deadbeef');
+  check(
+    'digest-Pin: Variante bleibt im Freshness-Matching (alpine3.24)',
+    newestSameMajorTag(nodePin.tag!, ['26.13.0-alpine3.24', '26.13.0-alpine3.21', '26.14.0-alpine3.24']) === '26.14.0-alpine3.24'
+  );
+  check(
+    'digest-Pin: identischer Tag/Digest → keine Mutation',
+    digestPinVerdict(nodePin.digest, 'sha256:deadbeef').mutated === false
+  );
+  check(
+    'digest-Pin: anderer Digest am selben Tag → Mutation gemeldet',
+    digestPinVerdict(nodePin.digest, 'sha256:cafebabe').mutated === true
+  );
+  check(
+    'digest-Pin: unbekannter Registry-Digest → KEIN Fehlalarm',
+    digestPinVerdict(nodePin.digest, null).mutated === false
+  );
+
   process.stdout.write(ok ? './ image-freshness-test PASS\n' : '✗ image-freshness-test FAIL\n');
   return ok ? 0 : 1;
 }
@@ -820,12 +856,29 @@ function digestTest(): number {
     // 5) Report-Empfehlung klingt ehrlich je Fall
     const moving = imageVulnAdvice({ digestChanged: true });
     const newerTag = imageVulnAdvice({ digestChanged: false, updateAvailable: true });
-    const releaseOnly = imageVulnAdvice({ digestChanged: false, updateAvailable: false, upstreamLatest: 'v0.0.84' });
+    const releaseOnly = imageVulnAdvice({
+      digestChanged: false,
+      updateAvailable: false,
+      upstreamLatest: 'v0.0.84',
+      upstreamReleaseWithoutImage: true,
+    });
     const nothing = imageVulnAdvice({ digestChanged: false, updateAvailable: false, upstreamLatest: null });
     check('Empfehlung beweglicher Tag', /beweglich.*Rebuild/.test(moving), moving);
     check('Empfehlung neuer Tag (kein Rebuild-Rat)', /Pin auf neueren Tag/.test(newerTag) && !/Rebuild zieht/.test(newerTag), newerTag);
     // v1.6.3: Release ohne Image (playwright/mcp v0.0.84) darf NICHT zum Pin raten.
     check('Empfehlung Release ohne Image', /abwarten/.test(releaseOnly) && !/Pin auf neueren/.test(releaseOnly), releaseOnly);
+    // v1.8.2: gleiches `upstreamLatest`, aber Image IST publiziert → kein "abwarten".
+    const releasePublished = imageVulnAdvice({
+      digestChanged: false,
+      updateAvailable: false,
+      upstreamLatest: 'v0.76.2',
+      upstreamReleaseWithoutImage: false,
+    });
+    check(
+      'Empfehlung Release mit Image: kein "abwarten"',
+      !/abwarten/.test(releasePublished) && /keine neuere Version/.test(releasePublished),
+      releasePublished
+    );
     check('Empfehlung ohne alles: ehrlich, kein Handlungsdruck', /keine neuere Version/.test(nothing) && !/Pin auf neueren/.test(nothing), nothing);
     const line = imageVulnLines([{ repo: 'demo', image: ref, high: 6, critical: 0, digestChanged: false }]).find((l) => l.includes('•')) ?? '';
     check('Telegram-Zeile ≤ 120 Zeichen', line.length > 0 && line.length <= 120, `${line.length} Zeichen`);
@@ -947,8 +1000,9 @@ async function releaseVersionTest(): Promise<number> {
   check('(e) Draft-Release wird ignoriert', draftOnly.latestRelease === 'v0.8.7' && draftOnly.newerThanTag === false, String(draftOnly.latestRelease));
 
   // (f) Fehler im Release-Fetch → kein Throw, keine falsche Aussage
+  // (currentTag bewusst ≠ 0.76.2, sonst kollidiert der Prozess-Cache mit (i)).
   const broken = await upstreamReleaseCheck(
-    { base: 'aquasec/trivy', currentTag: '0.76.2', registry: 'docker-hub' },
+    { base: 'aquasec/trivy', currentTag: '0.76.0', registry: 'docker-hub' },
     {
       fetchReleases: async () => {
         throw new Error('simulierter GitHub-Fehler');
@@ -973,9 +1027,14 @@ async function releaseVersionTest(): Promise<number> {
     exactPin: null,
     updateAvailable: false,
   };
-  check('(g) upstreamNewerOnly erkennt Release-ohne-Image', upstreamNewerOnly({ ...baseFinding, upstreamLatest: 'v0.0.84' }));
+  check('(g) upstreamNewerOnly erkennt Release-ohne-Image', upstreamNewerOnly({ ...baseFinding, upstreamLatest: 'v0.0.84', upstreamReleaseWithoutImage: true }));
   check('(g) ohne Release → KEIN upstream-Only', !upstreamNewerOnly({ ...baseFinding, upstreamLatest: null }));
   check('(g) mit Update → upstream-Only false', !upstreamNewerOnly({ ...baseFinding, upstreamLatest: 'v0.0.84', updateAvailable: true }));
+  // v1.8.2: Release da, Image ABER publiziert → KEINE "kein Image"-Aussage.
+  check(
+    '(g) Release existiert + Image publiziert → upstream-Only false',
+    !upstreamNewerOnly({ ...baseFinding, upstreamLatest: 'v0.0.84', upstreamReleaseWithoutImage: false })
+  );
 
   // (h) v1.7.1: Registry-Tag-Präfix ≠ Git-Release-Tag-Präfix.
   // Beleg 2026-11-07: aquasec/trivy (Docker Hub: 0.76.2) vs Git-Tag v0.76.2.
@@ -1016,6 +1075,77 @@ async function releaseVersionTest(): Promise<number> {
   check('(h) unbelastbare Probe (null) → keine falsche "kein Image"-Behauptung',
     unknownProbe.releaseWithoutImage !== true && /unbekannt/.test(unknownProbe.note ?? ''),
     unknownProbe.note ?? '—');
+
+  // (i) v1.8.2-Regression: DER False Positive des täglichen Reports.
+  // `aquasec/trivy:0.76.2` bei Upstream-Release `v0.76.2` — Release ist NICHT
+  // neuer als der Pin, das Image existiert. Vorher setzte der Image-Scan
+  // `upstreamLatest` trotzdem und der Report schrieb "Release v0.76.2 existiert,
+  // kein Image publiziert".
+  const trivyEqual = await upstreamReleaseCheck(
+    { base: 'aquasec/trivy', currentTag: '0.76.2', registry: 'docker-hub' },
+    {
+      fetchReleases: async () => releasesFor(['v0.76.2']),
+      manifestExists: async () => true,
+    }
+  );
+  check('(i) Release = Pin → newerThanTag false', trivyEqual.newerThanTag === false, trivyEqual.note ?? '—');
+  check('(i) Release = Pin → KEIN releaseWithoutImage', trivyEqual.releaseWithoutImage !== true);
+  check(
+    '(i) Release = Pin → kein "kein Image publiziert" im Report-Trigger',
+    !upstreamNewerOnly({
+      ...baseFinding,
+      // so setzt der Image-Scan die Felder seit v1.8.2: nur bei newerThanTag
+      upstreamLatest: trivyEqual.newerThanTag ? trivyEqual.latestRelease : null,
+      upstreamReleaseWithoutImage: trivyEqual.releaseWithoutImage === true,
+    })
+  );
+
+  // (j) v1.8.2: Digest-Pin-Blindstelle — Tag-Ebene bleibt getrackt.
+  check('(j) splitRef trennt Tag und Digest',
+    (() => {
+      const r = splitRef('aquasec/trivy:0.76.2@sha256:8f6bb947');
+      return r.base === 'aquasec/trivy' && r.tag === '0.76.2' && r.digest === 'sha256:8f6bb947' && r.registry === 'docker-hub';
+    })());
+  check('(j) gleicher Digest → keine Mutation', digestPinVerdict('sha256:aaa', 'sha256:aaa').mutated === false);
+  check('(j) anderer Digest → Tag mutiert', digestPinVerdict('sha256:aaa', 'sha256:bbb').mutated === true);
+  check('(j) Digest-Groß-/Kleinschreibung egal', digestPinVerdict('sha256:AAA', 'sha256:aaa').mutated === false);
+  check('(j) Lookup-Fehler (null) → keine Mutation, aber unbekannt',
+    digestPinVerdict('sha256:aaa', null).mutated === false && digestPinVerdict('sha256:aaa', null).known === false);
+  check('(j) Digest-Pin-Freshness: neuerer Tag im selben Major erkannt',
+    newestSameMajorTag('0.76.2', ['0.76.1', '0.76.2', '0.76.3']) === '0.76.3' &&
+      strictlyNewer('0.76.2', '0.76.3') === true);
+  check('(j) Digest-Pin-Freshness: kein Major-Jump',
+    newestSameMajorTag('0.76.2', ['1.0.0', '2.1.0']) === null);
+  const digestStatus = digestPinStatusText({
+    digestPinned: true,
+    updateAvailable: true,
+    tagMutated: true,
+    newestSameMajor: '0.76.3',
+    pinnedDigest: 'sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb',
+    digest: 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+  });
+  check('(j) Report-Status nennt Tag-Update UND Mutation',
+    /neuer Tag 0\.76\.3/.test(digestStatus) && /Tag mutiert/.test(digestStatus) && /kein Auto-PR/.test(digestStatus),
+    digestStatus);
+  check('(j) shortDigest kürzt auf 12 Hex-Zeichen',
+    shortDigest('sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb') === 'sha256:8f6bb947dbc5…',
+    shortDigest('sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb'));
+
+  // (k) v1.8.2: Manifest-Probe wiederholt NUR transiente Fehler.
+  let tries = 0;
+  const flaky = await withManifestRetry(async () => {
+    tries++;
+    return tries < 2
+      ? { retryable: true, digest: null as string | null }
+      : { retryable: false, digest: 'sha256:ok' as string | null };
+  }, 2, 0);
+  check('(k) transienter Fehler → Retry, danach Treffer', tries === 2 && flaky.digest === 'sha256:ok', `tries=${tries}`);
+  let hardTries = 0;
+  const hard = await withManifestRetry(async () => {
+    hardTries++;
+    return { retryable: false, digest: null as string | null };
+  }, 2, 0);
+  check('(k) belastbare 404-Antwort → KEIN Retry', hardTries === 1 && hard.digest === null, `tries=${hardTries}`);
 
   process.stdout.write(ok ? './ release-version-test PASS\n' : '✗ release-version-test FAIL\n');
   return ok ? 0 : 1;
