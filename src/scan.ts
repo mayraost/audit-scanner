@@ -121,6 +121,11 @@ export interface ImageVulnFinding {
   updateAvailable?: boolean;
   /** v1.6.3: neuestes Upstream-GitHub-Release (Info, wenn kein Image publiziert). */
   upstreamLatest?: string | null;
+  /**
+   * v1.8.2: Die Registry-Probe war belastbar 404 — das Release hat wirklich
+   * kein Image. Ohne dieses Flag darf keine Empfehlung "abwarten" entstehen.
+   */
+  upstreamReleaseWithoutImage?: boolean;
 }
 
 /**
@@ -130,14 +135,18 @@ export interface ImageVulnFinding {
  * 2026-11-07).
  */
 export function imageVulnAdvice(
-  f: Pick<ImageVulnFinding, 'digestChanged' | 'updateAvailable' | 'upstreamLatest'>
+  f: Pick<ImageVulnFinding, 'digestChanged' | 'updateAvailable' | 'upstreamLatest' | 'upstreamReleaseWithoutImage'>
 ): string {
   // 1) Beweglicher Tag: Rebuild zieht den aktuellen Digest.
   if (f.digestChanged) return 'Tag beweglich, Rebuild zieht neuen Digest';
   // 2) Neuerer Tag existiert: Pin nachziehen.
   if (f.updateAvailable) return 'Pin auf neueren Tag erhöhen';
-  // 3) Release existiert, aber kein Image: warten, nichts tun.
-  if (f.upstreamLatest) return `nur Release ${f.upstreamLatest}, kein neueres Image — abwarten`;
+  // 3) Release existiert, aber (belastbar!) kein Image: warten, nichts tun.
+  //    v1.8.2: nur mit `upstreamReleaseWithoutImage` — sonst behauptete die
+  //    Zeile "abwarten", obwohl das Image längst publiziert ist.
+  if (f.upstreamLatest && f.upstreamReleaseWithoutImage) {
+    return `nur Release ${f.upstreamLatest}, kein neueres Image — abwarten`;
+  }
   // 4) Nichts verfügbar: ehrlich sagen, statt zum Handeln zu drängen.
   return 'keine neuere Version verfügbar — CVEs im Base-Image';
 }
@@ -414,6 +423,8 @@ export function collectImageVulnFindings(repos: RepoResult[]): ImageVulnFinding[
         // die 🛡-Zeile nicht, ob überhaupt eine neuere Version existiert.
         updateAvailable: f.updateAvailable ?? false,
         upstreamLatest: f.upstreamLatest ?? null,
+        // v1.8.2: "abwarten" nur, wenn das Release belastbar KEIN Image hat.
+        upstreamReleaseWithoutImage: f.upstreamReleaseWithoutImage === true,
       });
     }
   }
@@ -895,17 +906,59 @@ function pinningTable(pins: PinFinding[]): string {
  * v1.6.3: Upstream-Release neuer als der Tag, aber KEIN neuerer Registry-Tag
  * (Registry und Release laufen auseinander — z. B. playwright-mcp: Release
  * v0.0.84 da, MCR-Image fehlt). Reine Report-Information, kein Telegram-Trigger.
+ *
+ * v1.8.2: zusätzlich `upstreamReleaseWithoutImage === true` verlangt. Die
+ * belastbare Registry-Probe ist die EINZIGE Quelle für "kein Image publiziert";
+ * ein gesetztes `upstreamLatest` allein (Release = Pin) reicht nicht mehr.
  */
 export function upstreamNewerOnly(
-  f: Pick<ImageFinding, 'note' | 'updateAvailable' | 'floating' | 'exactPin' | 'upstreamLatest'>
+  f: Pick<
+    ImageFinding,
+    'note' | 'updateAvailable' | 'floating' | 'exactPin' | 'upstreamLatest' | 'upstreamReleaseWithoutImage'
+  >
 ): boolean {
   return (
     !f.note &&
     !f.updateAvailable &&
     !(f.floating && f.exactPin) &&
+    f.upstreamReleaseWithoutImage === true &&
     typeof f.upstreamLatest === 'string' &&
     f.upstreamLatest.length > 0
   );
+}
+
+/** Kurzform eines Digests für Report/Telegram (`sha256:8f6bb947…`). */
+export function shortDigest(digest: string | null | undefined): string {
+  const d = (digest ?? '').trim();
+  if (!d) return '?';
+  const [algo, hex] = d.includes(':') ? d.split(':', 2) : ['sha256', d];
+  return `${algo}:${(hex ?? '').slice(0, 12)}…`;
+}
+
+/**
+ * Status-Text für einen digest-gepinnten Ref (v1.8.2) — reine Funktion, damit
+ * Report und Selbsttest dieselbe Formulierung prüfen. Der Tag wird weiter
+ * getrackt (Freshness + Mutation), obwohl der CVE-Scan ausfällt.
+ */
+export function digestPinStatusText(
+  f: Pick<
+    ImageFinding,
+    'digestPinned' | 'updateAvailable' | 'tagMutated' | 'newestSameMajor' | 'pinnedDigest' | 'digest' | 'variantDrift'
+  >
+): string {
+  const parts: string[] = [`digest ${shortDigest(f.pinnedDigest)}`];
+  if (f.updateAvailable && f.newestSameMajor) {
+    parts.push(`⚠️ neuer Tag ${f.newestSameMajor} verfügbar (kein Auto-PR)`);
+  } else if (f.newestSameMajor) {
+    parts.push(`Tag aktuell (${f.newestSameMajor})`);
+  } else {
+    parts.push('Tag aktuell');
+  }
+  if (f.tagMutated) {
+    parts.push(`⚠️ Tag mutiert (${shortDigest(f.pinnedDigest)} → ${shortDigest(f.digest)})`);
+  }
+  if (f.variantDrift) parts.push(`variant drift: ${f.variantDrift}`);
+  return parts.join(' · ');
 }
 
 /** 🐳-Sektion je Repo (Report-MD): nur Images mit vulns/update/note. */
@@ -919,6 +972,12 @@ function imageTable(images: ImageFinding[]): string {
       : '';
     if (f.note) {
       rows.push(`| ${f.image} | — | — | — | ${f.note} |`);
+    } else if (f.digestPinned) {
+      // v1.8.2: Digest-Pins sind wieder sichtbar. Spalte 1 ohne @digest (die
+      // Ref wäre sonst 100+ Zeichen breit), Digest steht im Status.
+      rows.push(
+        `| ${f.base}:${f.current} | ${f.current} | ${f.newestSameMajor ?? '—'} | ${vc} | ${digestPinStatusText(f)} |`
+      );
     } else if (f.updateAvailable) {
       const status =
         f.eligibility === 'too-young'
@@ -948,11 +1007,18 @@ function imageTable(images: ImageFinding[]): string {
         f.digestChanged === true
           ? ' · Tag beweglich (Rebuild zieht neuen Digest)'
           : '';
+      // v1.8.2: Release existiert UND Image ist publiziert (Probe present) —
+      // dann ist "aktuell" für den Pin korrekt, der Release-Stand gehört aber
+      // sichtbar in die Zeile (Registry-Tag kann anders heißen, v1.7.1).
+      const releasePart =
+        f.upstreamNewerThanTag === true && f.upstreamLatest
+          ? ` · ℹ️ Release ${f.upstreamLatest} publiziert`
+          : '';
       rows.push(
         `| ${f.image} | ${f.current} | ${f.newestSameMajor ?? '—'} | ${vc} | ` +
           (f.pinned
-            ? `pinned, aktuell${digestPart}`
-            : `floating (Rebuild${f.digestChanged === true ? ' zieht neuen Digest' : ' aktualisiert'})`) + ' |'
+            ? `pinned, aktuell${digestPart}${releasePart}`
+            : `floating (Rebuild${f.digestChanged === true ? ' zieht neuen Digest' : ' aktualisiert'})${releasePart}`) + ' |'
       );
     }
   }
@@ -985,7 +1051,7 @@ async function sendTelegramFromReport(report: Report, state: State, fixPrs: bool
   const novel = novelImageVulns(report, fixPrs ? state : undefined);
   const hasNew =
     report.repos.some((r) => r.findings.some((f) => !isSuppressed(f))) ||
-    report.repos.some((r) => r.images?.some((i) => i.updateAvailable) ?? false) ||
+    report.repos.some((r) => r.images?.some((i) => i.updateAvailable || i.tagMutated) ?? false) ||
     // Base-Image-CVEs zählen nur, wenn SIE neu sind/ihre Zahl sich geändert hat.
     novel.length > 0 ||
     // Neue Pins-PRs / neue exakte Image-Pinning-Bumps zählen als "neu" (v1.5.0)
@@ -1159,10 +1225,19 @@ export function telegramBody(
   // v1.6.3: upstreamNewerOnly (Release existiert, Image fehlt) ist ebenfalls
   // KEIN Handlungspunkt → löst keinen Versand aus; wenn der Alert aber ohnehin
   // rausgeht, bekommt das Repo seine Zeile (ehrlicher als "aktuell").
+  // v1.8.2: Digest-Pins mit neuem Tag oder Tag-Mutation sind Info-Handlungspunkte
+  // (kein Auto-PR, aber der Mensch soll es sehen).
   const imgRepos = report.repos.filter(
     (r) =>
       !!r.imagePr?.prUrl ||
-      r.images?.some((i) => !i.note && (i.updateAvailable || i.floating || upstreamNewerOnly(i)))
+      r.images?.some(
+        (i) =>
+          !i.note &&
+          (i.updateAvailable ||
+            i.floating ||
+            upstreamNewerOnly(i) ||
+            (i.digestPinned && (i.updateAvailable || i.tagMutated)))
+      )
   );
   if (imgRepos.length > 0) {
     lines.push('🐳 Image-Scan (Dockerfile/compose):');
@@ -1172,11 +1247,28 @@ export function telegramBody(
         // skip: unscannable (note), pinned+aktuell und reiner variantDrift —
         // nur echte Handlungspunkte (Update/floating) plus v1.6.3 die
         // Release-ohne-Image-Info kommen in den Alert.
-        if (f.note || (!f.updateAvailable && !f.floating && !upstreamNewerOnly(f))) continue;
+        if (
+          f.note ||
+          (!f.updateAvailable && !f.floating && !upstreamNewerOnly(f) && !(f.digestPinned && f.tagMutated))
+        ) {
+          continue;
+        }
         const vc = `H${f.vulns.high}/C${f.vulns.critical}`;
-        // v1.6.0 Soaking: zu junge Kandidaten werden im Alert NICHT als Aktion
-        // gezeigt (nur Report) — Package-Poisoning-Schutz.
-        if (f.updateAvailable && f.eligibility === 'too-young') {
+        // v1.8.2: Digest-Pin zuerst — dort ist der CVE-Scan bewusst aus, `vc`
+        // wäre irreführend. Mutation wiegt schwerer als ein neuer Tag.
+        if (f.digestPinned) {
+          const ref = `${f.base}:${f.current}`;
+          if (f.tagMutated) {
+            lines.push(
+              `  • ${ref} — ⚠️ Tag mutiert (${shortDigest(f.pinnedDigest)} → ${shortDigest(f.digest)})`
+            );
+          }
+          if (f.updateAvailable) {
+            lines.push(`  • ${ref} — ℹ️ digest-pinned; neuer Tag ${f.newestSameMajor} (kein Auto-PR)`);
+          }
+        } else if (f.updateAvailable && f.eligibility === 'too-young') {
+          // v1.6.0 Soaking: zu junge Kandidaten werden im Alert NICHT als Aktion
+          // gezeigt (nur Report) — Package-Poisoning-Schutz.
           lines.push(`  • ${f.image} → ${f.newestSameMajor} ⏳ ${f.eligibilityLabel} (Report) [${vc}]`);
         } else if (f.updateAvailable) {
           const badge = f.eligibility === 'cve-exempt' ? ' 🔴 CVE-Fix' : '';

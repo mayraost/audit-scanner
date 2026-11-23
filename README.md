@@ -167,8 +167,10 @@ Je Repo dedupliziert (Ref über alle Files gemerged), dann:
    `auth.docker.io`-Token-Flow, GHCR analog; Paginierung bis 2 Seiten) →
    neuester gepinnter Tag **im selben Major** (Variant-Präferenz: passende
    `-alpine`-Varianten bevorzugt). Pre-Releases (`-alpha/-beta/-rc/-dev`)
-   ausgeschlossen. Digest-pinned / `latest` / tag-less / `$VAR`-Refs → Skip
-   mit Note. Andere Registries (`gcr.io`, `quay.io`, `registry.k8s.io`, …)
+   ausgeschlossen. `latest` / tag-less / `$VAR`-Refs → Skip mit Note.
+   **Digest-Pins** (`tag@sha256:…`, seit v1.8.2) laufen in einen eigenen Pfad:
+   Tag-Freshness + Tag-Mutation ja, `trivy image`-Scan nein (Digest
+   unveränderlich). Andere Registries (`gcr.io`, `quay.io`, `registry.k8s.io`, …)
    werden von trivy gescannt, aber der Freshness-Check bleibt Docker Hub +
    GHCR vorbehalten.
    **Variant-Regel (token-basiert, seit v1.6.0):** Die Variante wird an `-`
@@ -196,7 +198,15 @@ Je Repo dedupliziert (Ref über alle Files gemerged), dann:
      floating → neuester exakter Tag im selben Major mit Variant-Fallback
      (`node:24-alpine` → `node:24.22.2-alpine3.24`).
    - **`latest` / tag-less** → report-only Note (Major-Sprung-Risiko, Pins beim
-     Menschen). Digest-pinned refs bleiben Skip (schon reproduzierbar).
+     Menschen).
+   - **Digest-pinned** (`image:tag@sha256:…`, seit v1.8.2) → **kein** Auto-PR
+     (der Digest ist eine bewusste Reproduzierbarkeits-Entscheidung), aber
+     **weiter im Report**: Tag-Freshness (gibt es im selben Major einen
+     neueren Tag?) und Tag-Mutation (zeigt derselbe Tag auf einen anderen
+     Digest als den gepinnten?). Der CVE-Scan entfällt (Digest unveränderlich).
+     Vorher wurden diese Refs komplett übersprungen — `aquasec/trivy`,
+     `pgvector`, `python` und alle node-Digest-Pins verschwanden lautlos aus
+     dem Update-Report.
 4. **Report/Telegram**: Sektion `🐳 Images` je Repo
    (Image | current | newest | Vulns H/C | Status); Image-PRs erscheinen als
    eigene `imagePrs`-Summary-Zeile und als State-Eintrag `kind: "image"`
@@ -251,6 +261,20 @@ Je Repo dedupliziert (Ref über alle Files gemerged), dann:
    `library/*`) stehen bewusst auf `null` (kein sinnvolles GH-Release). Neue
    Einträge dort nur mit belegtem Upstream-Repo ergänzen. Selbsttest:
    `node dist/index.js release-version-test` (Fake-Releases, kein Netzwerk).
+   **v1.8.2 — zwei Präzisierungen (False-Positive-Fix):**
+   1. `upstreamLatest` wird nur noch bei `newerThanTag === true` gesetzt.
+      Vorher stand dort auch der Release-Tag, der dem Pin **exakt** entspricht
+      (`aquasec/trivy:0.76.2` vs. Release `v0.76.2`) — der Report las daraus
+      täglich „Release v0.76.2 existiert, kein Image publiziert", obwohl das
+      Image (OCI-Index `sha256:8f6bb947…`) publiziert ist.
+   2. „kein Image publiziert" ist ausschließlich an die belastbare
+      Registry-Probe gebunden (`upstreamReleaseWithoutImage`): HTTP-2xx belegt
+      die Existenz jetzt auch dann, wenn die Registry keinen
+      `Docker-Content-Digest`-Header sendet; transiente Fehler (Netz, 429, 5xx)
+      werden **einmal** wiederholt (`withManifestRetry`) und ergeben danach
+      „unbekannt" statt einer Behauptung. 401/403/404 werden nie wiederholt.
+      Tag-Kandidaten werden für beliebig viele Zahlen-Komponenten
+      (`1.2.3.4`) präfix-geflippt.
 
 ## 📌 Pinning-Enforcement (seit v1.5.0)
 
@@ -667,6 +691,7 @@ Kompakte Release-Historie (git history; Version in package.json):
 | v1.7.7 | Crash-Diagnose: `NODE_OPTIONS=--report-on-signal --report-signal=SIGSEGV` → Diagnose-Report in `/app/logs` |
 | v1.8.0 | Beta-Kanal-PRs: Pakete bereits im Beta/RC-Kanal werden im Pins-PR gebumpt (`beta → beta` / `beta → stable`), nie `stable → beta`; Soaking gilt auch für Beta-Ziele |
 | v1.8.1 | Crash-Resilienz: Wrapper wiederholt native V8-Abbrüche (rc 133/134/139) genau einmal, solange kein Report geschrieben wurde; `--report-on-fatalerror`; RSS-Peak im Log; Alarm-Hinweis 26 h statt 48 h; Branch-ohne-PR-Crash-Rest wird neu aufgesetzt (Pins/Fix/Image) |
+| v1.8.2 | Image-Scan-Fixes: Digest-Pins (`tag@sha256:…`) werden wieder getrackt (Tag-Freshness + Tag-Mutation, weiter kein Auto-PR, kein CVE-Scan) statt übersprungen; „Release ohne Image" ist an die belastbare Registry-Probe gebunden (`upstreamReleaseWithoutImage`, HTTP-2xx = vorhanden, Retry bei transienten Fehlern) — behebt den täglichen trivy-False-Positive |
 
 ## Tests & Sicherheit
 
@@ -701,10 +726,20 @@ Kompakte Release-Historie (git history; Version in package.json):
 - `image-vulns-test` — synthetische Report-/State-Objekte: Legacy-`state.json`
   ohne `imageVulns`-Feld parst, Novelty-Regel (erster Lauf / unverändert /
   geänderte H/C-Zahl) und Telegram-🛡-Sektion inkl. 15-Zeilen-Kappung.
+- `release-version-test` — Upstream-Release-Check **offline** (Fake-Releases,
+  injizierte Manifest-Probe): `newerThanTag`, „kein Image" nur bei belastbarer
+  404-Probe (unbelastbar → „unbekannt"), Präfix-Flip (`v0.76.2` ↔ `0.76.2`),
+  Mapping `aquasec/trivy → aquasecurity/trivy`, Draft/Prerelease-Filter,
+  (v1.8.2) Regression „Release = Pin → kein ‚kein Image publiziert'",
+  Digest-Pin-Verdict (Mutation/Lookup-Fehler), `shortDigest`/
+  `digestPinStatusText` und `withManifestRetry` (transient → 2. Versuch,
+  belastbare 404 → kein Retry).
 - `image-freshness-test` — Image-Tag-Freshness ohne Netzwerk: Variant-
   Token-Matching (`alpine` → `alpine3.24` ja, `pg17` → `pg17-trixie` nein),
-  `variantDrift`, `strictlyNewer`-Invariante (semver-gleich = false) und
-  „pinned never DOWN into floating“.
+  `variantDrift`, `strictlyNewer`-Invariante (semver-gleich = false),
+  „pinned never DOWN into floating“ und (v1.8.2) Digest-Pins
+  (`tag@sha256:…`): Tag/Digest-Trennung, Freshness über den TAG, Mutation
+  erkannt, unbekannter Registry-Digest → kein Fehlalarm.
 - `triage-test` — LLM-Triage mit 2 Fake-Findings (kein Scan, kein Telegram).
 - `wrapper-test` (`sh test/scan-wrapper-test.sh`, Fake-`node`) — Wrapper-Pfade
   ohne echten Scan: Erfolg/Fehlschlag, Alarm genau einmal, Retry-Verhalten bei

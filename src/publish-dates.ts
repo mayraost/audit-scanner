@@ -178,16 +178,51 @@ async function ghcrToken(repo: string): Promise<string | null> {
   }
 }
 
+/** Ein Manifest-Probe-Versuch — inkl. Retry-Klassifikation (v1.8.2). */
+export interface ManifestAttempt {
+  /** HTTP-Status; null = Netzwerk-/Timeout-Fehler. */
+  status: number | null;
+  /** `Docker-Content-Digest` (null, wenn die Registry keinen liefert). */
+  digest: string | null;
+  note?: string;
+  /** true = transient (Netz, 429, 5xx) → Wiederholung sinnvoll. */
+  retryable: boolean;
+}
+
+/** Versuche je Manifest-Probe (transiente Fehler werden einmal wiederholt). */
+export const MANIFEST_ATTEMPTS = 2;
+/** Basis-Backoff zwischen den Versuchen. */
+export const MANIFEST_RETRY_DELAY_MS = 250;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /**
- * `Docker-Content-Digest` per HEAD auf `/v2/<repo>/manifests/<tag>`; wenn die
- * Registry HEAD nicht beherrscht (405/501), GET mit `Accept`-Headern und
- * ohne Body-Auswertung.
+ * Wiederholt eine Probe NUR bei transienten Antworten (Netz-/Timeout-Fehler,
+ * 429, 5xx). 401/403/404 sind belastbare Aussagen und werden nie wiederholt —
+ * sonst würde aus einem echten "Tag existiert nicht" ein künstliches Timeout.
+ * Exportiert, damit der Selbsttest den Retry offline prüfen kann.
  */
-async function manifestDigest(
+export async function withManifestRetry<T extends { retryable: boolean }>(
+  probe: () => Promise<T>,
+  attempts: number = MANIFEST_ATTEMPTS,
+  delayMs: number = MANIFEST_RETRY_DELAY_MS
+): Promise<T> {
+  let last = await probe();
+  for (let i = 1; i < attempts && last.retryable; i++) {
+    await sleep(delayMs * i);
+    last = await probe();
+  }
+  return last;
+}
+
+/** Ein Versuch: HEAD auf `/v2/<repo>/manifests/<tag>`, GET-Fallback bei 405/501. */
+async function manifestAttempt(
   url: string,
   headers: Record<string, string>,
   label: string
-): Promise<ImageDigestResult> {
+): Promise<ManifestAttempt> {
   const reqHeaders = { ...headers, Accept: MANIFEST_ACCEPT };
   try {
     let res = await fetch(url, {
@@ -198,17 +233,111 @@ async function manifestDigest(
     if (res.status === 405 || res.status === 501) {
       res = await fetch(url, { method: 'GET', headers: reqHeaders, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
     }
-    if (res.status === 401 || res.status === 403) return { digest: null, note: `${label} nicht öffentlich (${res.status})` };
-    if (res.status === 404) return { digest: null, note: `${label} Manifest unbekannt (404)` };
-    if (!res.ok) return { digest: null, note: `${label} Manifest ${res.status}` };
-    const digest = res.headers.get('docker-content-digest');
-    return digest ? { digest } : { digest: null, note: `${label} ohne Docker-Content-Digest-Header` };
+    if (res.status === 401 || res.status === 403) {
+      return { status: res.status, digest: null, note: `${label} nicht öffentlich (${res.status})`, retryable: false };
+    }
+    if (res.status === 404) {
+      return { status: 404, digest: null, note: `${label} Manifest unbekannt (404)`, retryable: false };
+    }
+    if (res.status === 429 || res.status >= 500) {
+      return { status: res.status, digest: null, note: `${label} Manifest ${res.status}`, retryable: true };
+    }
+    if (!res.ok) {
+      return { status: res.status, digest: null, note: `${label} Manifest ${res.status}`, retryable: false };
+    }
+    let digest = res.headers.get('docker-content-digest');
+    if (!digest) {
+      // Manche Registries senden den Header nur auf GET (HEAD = reiner
+      // Existenz-Check). Ein GET nachfassen, bevor "kein Digest" behauptet wird.
+      const g = await fetch(url, { method: 'GET', headers: reqHeaders, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+      if (g.ok) digest = g.headers.get('docker-content-digest');
+    }
+    return {
+      status: res.status,
+      digest,
+      note: digest ? undefined : `${label} ohne Docker-Content-Digest-Header`,
+      retryable: false,
+    };
   } catch (err) {
     return {
+      status: null,
       digest: null,
       note: `${label}-Fehler: ${err instanceof Error ? err.message.slice(0, 80) : '?'}`,
+      retryable: true,
     };
   }
+}
+
+/** Manifest-Probe mit Retry (transiente Fehler einmal wiederholen). */
+async function probeManifest(
+  url: string,
+  headers: Record<string, string>,
+  label: string
+): Promise<ManifestAttempt> {
+  return withManifestRetry(() => manifestAttempt(url, headers, label));
+}
+
+/** Digest-Ergebnis aus einer Probe ableiten (200 ohne Header → digest null). */
+async function manifestDigest(
+  url: string,
+  headers: Record<string, string>,
+  label: string
+): Promise<ImageDigestResult> {
+  const a = await probeManifest(url, headers, label);
+  return a.digest ? { digest: a.digest } : { digest: null, note: a.note };
+}
+
+/**
+ * Manifest-Ziel je Registry: URL + Auth-Header + Label. `null`-Note bedeutet
+ * "keine Manifest-Aussage möglich" (Registry ohne Support / Token-Fehler).
+ */
+interface ManifestTarget {
+  url: string;
+  headers: Record<string, string>;
+  label: string;
+  note?: undefined;
+}
+interface ManifestTargetError {
+  note: string;
+  url?: undefined;
+}
+
+async function manifestTarget(
+  base: string,
+  tag: string,
+  registry: DigestRegistry
+): Promise<ManifestTarget | ManifestTargetError> {
+  if (registry === 'docker-hub') {
+    const repo = base.includes('/') ? base : `library/${base}`;
+    const token = await dockerHubToken(repo);
+    if (token === null) return { note: 'Docker-Hub-Token-Fetch fehlgeschlagen' };
+    return {
+      url: `https://registry-1.docker.io/v2/${repo}/manifests/${encodeURIComponent(tag)}`,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      label: 'Docker-Hub',
+    };
+  }
+  if (registry === 'ghcr') {
+    const token = await ghcrToken(base);
+    if (token === null) return { note: 'GHCR-Token-Fetch fehlgeschlagen' };
+    return {
+      url: `https://ghcr.io/v2/${base}/manifests/${encodeURIComponent(tag)}`,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      label: 'GHCR',
+    };
+  }
+  if (registry === 'mcr') {
+    return {
+      url: `https://mcr.microsoft.com/v2/${base}/manifests/${encodeURIComponent(tag)}`,
+      headers: {},
+      label: 'MCR',
+    };
+  }
+  if (registry === 'quay') {
+    // Quay (v1.7.2): Manifest-Digest ohne Token (Tool-Images sind public).
+    return { url: `https://quay.io/v2/${base}/manifests/${encodeURIComponent(tag)}`, headers: {}, label: 'Quay' };
+  }
+  return { note: 'Registry ohne Digest-Lookup (fail-open)' };
 }
 
 /**
@@ -226,45 +355,57 @@ export async function imageDigest(
   const key = `digest|${registry}|${base}|${tag}`;
   const hit = digestCache.get(key);
   if (hit) return hit;
-  let out: ImageDigestResult;
-  if (registry === 'docker-hub') {
-    const repo = base.includes('/') ? base : `library/${base}`;
-    const token = await dockerHubToken(repo);
-    if (token === null) out = { digest: null, note: 'Docker-Hub-Token-Fetch fehlgeschlagen' };
-    else {
-      out = await manifestDigest(
-        `https://registry-1.docker.io/v2/${repo}/manifests/${encodeURIComponent(tag)}`,
-        token ? { Authorization: `Bearer ${token}` } : {},
-        'Docker-Hub'
-      );
-    }
-  } else if (registry === 'ghcr') {
-    const token = await ghcrToken(base);
-    if (token === null) out = { digest: null, note: 'GHCR-Token-Fetch fehlgeschlagen' };
-    else {
-      out = await manifestDigest(
-        `https://ghcr.io/v2/${base}/manifests/${encodeURIComponent(tag)}`,
-        token ? { Authorization: `Bearer ${token}` } : {},
-        'GHCR'
-      );
-    }
-  } else if (registry === 'mcr') {
-    out = await manifestDigest(
-      `https://mcr.microsoft.com/v2/${base}/manifests/${encodeURIComponent(tag)}`,
-      {},
-      'MCR'
-    );
-  } else if (registry === 'quay') {
-    // Quay (v1.7.2): Manifest-Digest ohne Token (Tool-Images sind public).
-    out = await manifestDigest(
-      `https://quay.io/v2/${base}/manifests/${encodeURIComponent(tag)}`,
-      {},
-      'Quay'
-    );
-  } else {
-    out = { digest: null, note: 'Registry ohne Digest-Lookup (fail-open)' };
-  }
+  const target = await manifestTarget(base, tag, registry);
+  const out: ImageDigestResult =
+    target.url === undefined
+      ? { digest: null, note: target.note }
+      : await manifestDigest(target.url, target.headers, target.label);
   digestCache.set(key, out);
+  return out;
+}
+
+/** Ergebnis einer Manifest-Existenz-Probe (v1.8.2). */
+export interface ImageManifestStatusResult {
+  /** present = Tag existiert (HTTP 2xx), absent = belastbar 404, unknown = keine Aussage. */
+  status: 'present' | 'absent' | 'unknown';
+  digest: string | null;
+  note?: string;
+}
+
+/** Cache pro Prozess: `status|registry|base|tag` → Ergebnis. */
+const manifestStatusCache = new Map<string, ImageManifestStatusResult>();
+
+/**
+ * Existiert `<tag>` auf der Registry? (v1.8.2)
+ *
+ * Robuster als ein reiner Digest-Lookup: ein HTTP-2xx belegt die Existenz auch
+ * dann, wenn die Registry keinen `Docker-Content-Digest`-Header sendet. Nur ein
+ * belastbares 404 ergibt `absent`; transiente Fehler werden wiederholt und
+ * ergeben danach `unknown` (Aufrufer behauptet dann NICHTS).
+ */
+export async function imageManifestStatus(
+  base: string,
+  tag: string,
+  registry: DigestRegistry
+): Promise<ImageManifestStatusResult> {
+  const key = `status|${registry}|${base}|${tag}`;
+  const hit = manifestStatusCache.get(key);
+  if (hit) return hit;
+  const target = await manifestTarget(base, tag, registry);
+  let out: ImageManifestStatusResult;
+  if (target.url === undefined) {
+    out = { status: 'unknown', digest: null, note: target.note };
+  } else {
+    const a = await probeManifest(target.url, target.headers, target.label);
+    if (a.status !== null && a.status >= 200 && a.status < 300) {
+      out = { status: 'present', digest: a.digest, note: a.note };
+    } else if (a.status === 404) {
+      out = { status: 'absent', digest: null, note: a.note };
+    } else {
+      out = { status: 'unknown', digest: null, note: a.note };
+    }
+  }
+  manifestStatusCache.set(key, out);
   return out;
 }
 

@@ -27,7 +27,7 @@ import semver from 'semver';
 
 import { log } from './config.js';
 import { ghJson } from './github.js';
-import { imageDigest, type DigestRegistry } from './publish-dates.js';
+import { imageManifestStatus, type DigestRegistry } from './publish-dates.js';
 
 const HTTP_TIMEOUT_MS = 10_000;
 
@@ -162,10 +162,12 @@ export interface ReleaseCheckDeps {
 export function registryTagCandidates(releaseTag: string): string[] {
   const tag = releaseTag.trim();
   if (!tag) return [];
-  // Nur reine Versions-Tags `x.y[.z]` (optional `v`) flippen. Build-Meta-/
+  // Nur reine Versions-Tags `x.y[.z[.w…]]` (optional `v`) flippen. Build-Meta-/
   // Datums-Tags wie `2026.11.1-9ded3bec1` oder `main-20261101`: dort ist der
   // Flip bedeutungslos (kein Registry-Tag heißt so) → verbatim, kein Rauschen.
-  const m = /^(v?)(\d+(?:\.\d+){1,2})$/.exec(tag);
+  // v1.8.2: beliebig viele Zahlen-Komponenten (`1.2.3.4` taggen manche Projekte
+  // so) — der Flip ist immer nur ein Präfix-Wechsel und damit risikofrei.
+  const m = /^(v?)(\d+(?:\.\d+)+)$/.exec(tag);
   if (!m) return [tag];
   const [, v] = m;
   const flipped = v ? tag.slice(1) : `v${tag}`;
@@ -187,19 +189,18 @@ async function defaultFetchReleases(repo: string): Promise<GhRelease[]> {
 }
 
 /**
- * Manifest-Existenz per Digest-Lookup: `digest !== null` → Tag publiziert;
- * 404-Note → nicht publiziert; alles andere (Token-/Netzwerkfehler,
- * `other`-Registry) → null (unbekannt, keine falsche Aussage).
+ * Manifest-Existenz per Status-Probe (v1.8.2): HTTP-2xx belegt die Existenz
+ * auch ohne `Docker-Content-Digest`-Header; nur ein belastbares 404 gilt als
+ * "nicht publiziert"; transiente Fehler (nach Retry) → null = unbekannt.
  */
 async function defaultManifestExists(
   base: string,
   tag: string,
   registry: ReleaseRegistry
 ): Promise<boolean | null> {
-  const d = await imageDigest(base, tag, registry);
-  if (d.digest !== null) return true;
-  const note = d.note ?? '';
-  if (/404|Manifest unbekannt/.test(note)) return false;
+  const s = await imageManifestStatus(base, tag, registry);
+  if (s.status === 'present') return true;
+  if (s.status === 'absent') return false;
   return null;
 }
 
