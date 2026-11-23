@@ -1,7 +1,12 @@
 # syntax=docker/dockerfile:1
 # Multi-Stage: build (TS) → deps-prod (semver) → runner (node26-alpine + trivy).
 # Gotcha-Vermerk: aquasec/trivy:0.68.0 existiert auf Docker Hub MAHR (404, Tags
-# rotieren) — gepinnt ist 0.76.1 (21.10.2026), bei Upgrade unten anpassen.
+# rotieren) — gepinnt ist 0.76.2 (05.11.2026), bei Upgrade unten anpassen.
+# Trivy ist der Trust-Root der ganzen Audit-Pipeline → Tag UND Index-Digest
+# gepinnt (Tag-Re-Pointing würde fremden Scanner-Code einbauen).
+# ACHTUNG: digest-gepinnte Refs werden vom eigenen Image-Scan übersprungen
+# (image-scan.ts addRef: `digest-pinned — Freshness übersprungen`) — Trivy-
+# Updates dieses Images müssen daher manuell/über Renovate nachgezogen werden.
 
 FROM node:26.13.1-alpine3.24 AS build
 WORKDIR /app
@@ -20,7 +25,7 @@ FROM node:26.13.1-alpine3.24 AS runner
 ENV NODE_ENV=production
 ENV TZ=Europe/Berlin
 ENV TRIVY_CACHE_DIR=/app/.cache/trivy
-COPY --from=aquasec/trivy:0.76.2 /usr/local/bin/trivy /usr/local/bin/trivy
+COPY --from=aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb /usr/local/bin/trivy /usr/local/bin/trivy
 # TZ=Europe/Berlin: Busybox-crond löst Zeitzonen via zoneinfo auf → tzdata nötig
 # git: Renovate (`--platform=local`) arbeitet auf einem echten Checkout (v1.7.0)
 RUN apk add --no-cache tzdata git
