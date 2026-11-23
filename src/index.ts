@@ -879,6 +879,13 @@ function digestTest(): number {
       !/abwarten/.test(releasePublished) && /keine neuere Version/.test(releasePublished),
       releasePublished
     );
+    // v1.8.2: Digest-Pin mit Tag-Mutation → Pin prüfen, kein Rebuild-Rat.
+    const mutated = imageVulnAdvice({ digestChanged: false, updateAvailable: false, tagMutated: true });
+    check(
+      'Empfehlung Tag-Mutation: Digest-Pin prüfen',
+      /Tag mutiert/.test(mutated) && /Digest-Pin prüfen/.test(mutated) && !/Rebuild zieht/.test(mutated),
+      mutated
+    );
     check('Empfehlung ohne alles: ehrlich, kein Handlungsdruck', /keine neuere Version/.test(nothing) && !/Pin auf neueren/.test(nothing), nothing);
     const line = imageVulnLines([{ repo: 'demo', image: ref, high: 6, critical: 0, digestChanged: false }]).find((l) => l.includes('•')) ?? '';
     check('Telegram-Zeile ≤ 120 Zeichen', line.length > 0 && line.length <= 120, `${line.length} Zeichen`);

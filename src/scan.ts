@@ -126,6 +126,11 @@ export interface ImageVulnFinding {
    * kein Image. Ohne dieses Flag darf keine Empfehlung "abwarten" entstehen.
    */
   upstreamReleaseWithoutImage?: boolean;
+  /**
+   * v1.8.2: Digest-Pin, dessen Tag inzwischen auf einen anderen Digest zeigt
+   * (Tag-Mutation) — der Pin ist nicht mehr reproduzierbar, was er verspricht.
+   */
+  tagMutated?: boolean;
 }
 
 /**
@@ -135,8 +140,14 @@ export interface ImageVulnFinding {
  * 2026-11-07).
  */
 export function imageVulnAdvice(
-  f: Pick<ImageVulnFinding, 'digestChanged' | 'updateAvailable' | 'upstreamLatest' | 'upstreamReleaseWithoutImage'>
+  f: Pick<
+    ImageVulnFinding,
+    'digestChanged' | 'updateAvailable' | 'upstreamLatest' | 'upstreamReleaseWithoutImage' | 'tagMutated'
+  >
 ): string {
+  // 0) v1.8.2: Digest-Pin, aber der Tag zeigt auf einen anderen Digest als den
+  //    gepinnten — der Pin ist irreführend geworden (Tag wurde neu gedreht).
+  if (f.tagMutated) return 'Tag mutiert — Digest-Pin prüfen (Tag zeigt neuen Stand)';
   // 1) Beweglicher Tag: Rebuild zieht den aktuellen Digest.
   if (f.digestChanged) return 'Tag beweglich, Rebuild zieht neuen Digest';
   // 2) Neuerer Tag existiert: Pin nachziehen.
@@ -425,6 +436,9 @@ export function collectImageVulnFindings(repos: RepoResult[]): ImageVulnFinding[
         upstreamLatest: f.upstreamLatest ?? null,
         // v1.8.2: "abwarten" nur, wenn das Release belastbar KEIN Image hat.
         upstreamReleaseWithoutImage: f.upstreamReleaseWithoutImage === true,
+        // v1.8.2: Digest-Pins werden wieder gescannt → Mutation gehört in die
+        // Empfehlung (der Pin ist dann nicht mehr reproduzierbar).
+        tagMutated: f.tagMutated === true,
       });
     }
   }
@@ -1123,7 +1137,9 @@ export const IMAGE_VULN_TELEGRAM_MAX_LINES = 15;
  * Empfehlung je Zeile (v1.6.2) aus imageVulnAdvice — kompakt (< 120 Zeichen).
  */
 export function imageVulnLines(
-  novel: Array<Pick<ImageVulnFinding, 'repo' | 'image' | 'high' | 'critical' | 'digestChanged'>>
+  novel: Array<
+    Pick<ImageVulnFinding, 'repo' | 'image' | 'high' | 'critical' | 'digestChanged' | 'tagMutated'>
+  >
 ): string[] {
   if (novel.length === 0) return [];
   const lines: string[] = [];
@@ -1134,9 +1150,11 @@ export function imageVulnLines(
     lines.push(`*${repo}*:`);
     for (const e of entries) {
       if (shown >= IMAGE_VULN_TELEGRAM_MAX_LINES) break;
-      const advice = e.digestChanged === true
-        ? '→ Tag beweglich, Rebuild zieht neuen Digest'
-        : '→ Pin auf neueren Tag erhöhen (Rebuild hilft nicht)';
+      const advice = e.tagMutated === true
+        ? '→ Tag mutiert, Digest-Pin prüfen'
+        : e.digestChanged === true
+          ? '→ Tag beweglich, Rebuild zieht neuen Digest'
+          : '→ Pin auf neueren Tag erhöhen (Rebuild hilft nicht)';
       lines.push(trim(`  • ${e.image} [H${e.high}/C${e.critical}] ${advice}`, 120));
       shown++;
     }
