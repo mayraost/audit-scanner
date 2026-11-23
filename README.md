@@ -169,8 +169,8 @@ Je Repo dedupliziert (Ref über alle Files gemerged), dann:
    `-alpine`-Varianten bevorzugt). Pre-Releases (`-alpha/-beta/-rc/-dev`)
    ausgeschlossen. `latest` / tag-less / `$VAR`-Refs → Skip mit Note.
    **Digest-Pins** (`tag@sha256:…`, seit v1.8.2) laufen in einen eigenen Pfad:
-   Tag-Freshness + Tag-Mutation ja, `trivy image`-Scan nein (Digest
-   unveränderlich). Andere Registries (`gcr.io`, `quay.io`, `registry.k8s.io`, …)
+   Tag-Freshness + Tag-Mutation + `trivy image`-Scan (Digest unveränderlich,
+   aber nicht unbedenklich), nur ohne Auto-PR. Andere Registries (`gcr.io`, `quay.io`, `registry.k8s.io`, …)
    werden von trivy gescannt, aber der Freshness-Check bleibt Docker Hub +
    GHCR vorbehalten.
    **Variant-Regel (token-basiert, seit v1.6.0):** Die Variante wird an `-`
@@ -203,7 +203,10 @@ Je Repo dedupliziert (Ref über alle Files gemerged), dann:
      (der Digest ist eine bewusste Reproduzierbarkeits-Entscheidung), aber
      **weiter im Report**: Tag-Freshness (gibt es im selben Major einen
      neueren Tag?) und Tag-Mutation (zeigt derselbe Tag auf einen anderen
-     Digest als den gepinnten?). Der CVE-Scan entfällt (Digest unveränderlich).
+     Digest als den gepinnten?). Der CVE-Scan läuft weiter — ein Digest ist
+     unveränderlich, aber nicht unbedenklich (sonst fiele ausgerechnet der
+     Trust-Root `aquasec/trivy` aus der CVE-Sicht, sobald er digest-gepinnt
+     ist).
      Vorher wurden diese Refs komplett übersprungen — `aquasec/trivy`,
      `pgvector`, `python` und alle node-Digest-Pins verschwanden lautlos aus
      dem Update-Report.
@@ -691,7 +694,7 @@ Kompakte Release-Historie (git history; Version in package.json):
 | v1.7.7 | Crash-Diagnose: `NODE_OPTIONS=--report-on-signal --report-signal=SIGSEGV` → Diagnose-Report in `/app/logs` |
 | v1.8.0 | Beta-Kanal-PRs: Pakete bereits im Beta/RC-Kanal werden im Pins-PR gebumpt (`beta → beta` / `beta → stable`), nie `stable → beta`; Soaking gilt auch für Beta-Ziele |
 | v1.8.1 | Crash-Resilienz: Wrapper wiederholt native V8-Abbrüche (rc 133/134/139) genau einmal, solange kein Report geschrieben wurde; `--report-on-fatalerror`; RSS-Peak im Log; Alarm-Hinweis 26 h statt 48 h; Branch-ohne-PR-Crash-Rest wird neu aufgesetzt (Pins/Fix/Image) |
-| v1.8.2 | Image-Scan-Fixes: Digest-Pins (`tag@sha256:…`) werden wieder getrackt (Tag-Freshness + Tag-Mutation, weiter kein Auto-PR, kein CVE-Scan) statt übersprungen; „Release ohne Image" ist an die belastbare Registry-Probe gebunden (`upstreamReleaseWithoutImage`, HTTP-2xx = vorhanden, Retry bei transienten Fehlern) — behebt den täglichen trivy-False-Positive |
+| v1.8.2 | Image-Scan-Fixes: Digest-Pins (`tag@sha256:…`) werden wieder getrackt (Tag-Freshness + Tag-Mutation + CVE-Scan, weiter kein Auto-PR) statt übersprungen; „Release ohne Image" ist an die belastbare Registry-Probe gebunden (`upstreamReleaseWithoutImage`, HTTP-2xx = vorhanden, Retry bei transienten Fehlern) — behebt den täglichen trivy-False-Positive |
 
 ## Tests & Sicherheit
 

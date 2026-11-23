@@ -8,7 +8,8 @@
 // - Freshness-Check via Registry-Tag-Liste (Docker Hub / GHCR / MCR, anonymous
 //   token flow; MCR anonym ohne Auth-Header); latest / invalid Tags → Skip mit
 //   Note. Digest-Pins (v1.8.2) laufen in einen eigenen Pfad: Tag-Freshness +
-//   Tag-Mutation ja, trivy-CVE-Scan nein (Digest unveränderlich), kein Auto-PR.
+//   Tag-Mutation + CVE-Scan (Digest unveränderlich, aber nicht unbedenklich),
+//   nur ohne Auto-PR.
 // - Fix-PR-Policy (v1.5.0, AGENTS.md "Keine floating versions"):
 //   a) EXAKT gepinnte Tags (x.y.z) mit neuerer Version im selben Major → PR-Bump
 //      auf den neueren exakten Tag.
@@ -695,17 +696,26 @@ export async function scanRepoImages(
   // trivy image sequential (DB-Download-LockContention vermeiden); frisch
   // installierte Container-DB ist gecacht, typisch ≤ 5 Images je Repo.
   for (const f of findings) {
-    // v1.8.2: Digest-Pins NICHT mehr komplett überspringen. Der CVE-Scan bleibt
-    // aus (Digest ist unveränderlich — trivy scannt den Stand, der im Digest
-    // steckt, und der ändert sich nie), aber Tag-Freshness und Tag-Mutation
-    // werden weiter getrackt. Vorher verschwanden trivy/pgvector/python/node-
-    // Digest-Pins lautlos aus dem Report.
+    // v1.8.2: Digest-Pins NICHT mehr komplett überspringen. Der Tag wird auf
+    // Freshness + Mutation geprüft (vorher verschwanden trivy/pgvector/python/
+    // node-Digest-Pins lautlos aus dem Report) und das Image wird WEITER auf
+    // CVEs gescannt: ein Digest ist zwar unveränderlich (stabile Treffer), aber
+    // "unveränderlich" heißt nicht "unbedenklich" — der Trust-Root trivy darf
+    // nicht aus der CVE-Sicht fallen, nur weil er digest-gepinnt ist.
     if (f.digestPinned) {
+      const safe = f.image.replace(/[^A-Za-z0-9._\-/@:]/g, '_');
+      const outPath = path.join(scanTmp, `${repo.name}.img-${safe.replace(/[/:@]/g, '_')}.trivy.json`);
+      const vulns = await trivyImageScan(f.image, outPath);
+      f.vulns.high = vulns.high;
+      f.vulns.critical = vulns.critical;
+      // Freshness/Mutation auch bei trivy-Fehler tracken (Registry-Aussage ist
+      // unabhängig vom Scan); der Fehler landet additiv in der Note.
       await trackDigestPinnedFinding(f);
+      if (vulns.error) f.note = f.note ? `${f.note} · ${vulns.error}` : vulns.error;
       continue;
     }
     const safe = f.image.replace(/[^A-Za-z0-9._\-/@:]/g, '_');
-    if (f.note) continue; // latest/tagless/digest/invalid → kein Scan, Note bleibt stehen
+    if (f.note) continue; // latest/tagless/invalid → kein Scan, Note bleibt stehen
     const outPath = path.join(scanTmp, `${repo.name}.img-${safe.replace(/[/:@]/g, '_')}.trivy.json`);
     const vulns = await trivyImageScan(f.image, outPath);
     f.vulns.high = vulns.high;
@@ -834,9 +844,8 @@ export function digestPinVerdict(
 }
 
 /**
- * Digest-gepinnte Refs (v1.8.2): CVE-Scan bleibt aus (der Digest ist
- * unveränderlich — trivy würde für immer denselben Stand prüfen), aber die
- * Tag-Ebene wird weiter getrackt:
+ * Digest-gepinnte Refs (v1.8.2): die Tag-Ebene wird weiter getrackt, obwohl
+ * der Ref digest-gepinnt ist.
  *
  * 1. **Tag-Mutation**: derselbe Tag zeigt jetzt auf einen anderen Digest als
  *    den gepinnten. Das ist bei Digest-Pins das eigentliche Warnsignal — der
@@ -847,6 +856,8 @@ export function digestPinVerdict(
  * Bewusst KEIN Auto-PR: ein Digest-Pin ist eine bewusste Reproduzierbarkeits-
  * Entscheidung, kein Veraltungs-Befund. Der Report nennt das Ziel, der Mensch
  * entscheidet (ein Bump bräuchte ohnehin einen neuen, verifizierten Digest).
+ * Der CVE-Scan läuft vorher im Aufrufer (Digest unveränderlich, aber nicht
+ * unbedenklich).
  */
 async function trackDigestPinnedFinding(f: ImageFinding): Promise<void> {
   const cur = await imageDigest(f.base, f.current, f.registry);
@@ -899,9 +910,8 @@ function addRef(byKey: Map<string, ImageFinding>, ref: string, rel: string): voi
   }
   if (digest) {
     // v1.8.2: KEINE Skip-Note mehr — Digest-Pins laufen in einen eigenen Pfad
-    // (trackDigestPinnedFinding): kein CVE-Scan, aber Tag-Freshness +
-    // Tag-Mutations-Erkennung. `note` würde den Fund sonst aus dem Report
-    // drücken (scan.ts rendert note-Zeilen als reine Info-Zeile).
+    // (trackDigestPinnedFinding + CVE-Scan). `note` würde den Fund sonst aus
+    // dem Report drücken (scan.ts rendert note-Zeilen als reine Info-Zeile).
     const f = mkFinding(ref, base, tag, sem, rel, true);
     f.pinnedDigest = digest;
     byKey.set(ref, f);
